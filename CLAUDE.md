@@ -59,3 +59,4 @@ unzip -p android/src/main/libs/clashmicore.aar jni/arm64-v8a/libgojni.so \
 
 - 修改 Go 代码后,**生成的 `clashmicore.aar` / `clashmicore.jar` / `libgojni.so` 也需要一并提交**(Gradle 直接消费它们,Clash Mi app 通过 path 依赖引用本仓库)。
 - 上游应用 Clash Mi 通过相对路径 `../clashmi-vpn-service` 引用本插件;改动 Dart API 时记得同步上游调用点。
+- `.github/workflows/rebuild-android-core.yml` 会在本仓库 `main` 更新、收到 `mihomo-updated` dispatch、或手动触发时重建 gomobile Android 产物。若产物或 `core/mihomo` submodule 有变化,workflow 会提交回本仓库,随后 dispatch `cyenxchen/clashmi` 自动发布新版 APK。
