@@ -1,10 +1,13 @@
 package clashmicore
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
+	"github.com/metacubex/mihomo/component/dialer"
 	"gopkg.in/yaml.v3"
 )
 
@@ -59,6 +62,71 @@ func TestBuildRuntimeConfigPreservesRequestedTunStack(t *testing.T) {
 	assertScalar(t, dns, "fake-ip-range", androidTunFakeIPRange)
 }
 
+func TestProtectSocketUsesRawFd(t *testing.T) {
+	protector := &recordingProtector{ok: true}
+	conn := fakeRawConn{fd: 42}
+
+	if err := protectSocket(protector, "tcp", "example.com:443", conn); err != nil {
+		t.Fatal(err)
+	}
+	if protector.fd != 42 {
+		t.Fatalf("protected fd = %d, want 42", protector.fd)
+	}
+}
+
+func TestSetSocketProtectorInstallsDialerHook(t *testing.T) {
+	oldHook := dialer.DefaultSocketHook
+	t.Cleanup(func() {
+		dialer.DefaultSocketHook = oldHook
+	})
+
+	protector := &recordingProtector{ok: true}
+	SetSocketProtector(protector)
+
+	if dialer.DefaultSocketHook == nil {
+		t.Fatal("expected mihomo dialer socket hook to be installed")
+	}
+	if err := dialer.DefaultSocketHook("tcp", "example.com:443", fakeRawConn{fd: 99}); err != nil {
+		t.Fatal(err)
+	}
+	if protector.fd != 99 {
+		t.Fatalf("protected fd = %d, want 99", protector.fd)
+	}
+
+	SetSocketProtector(nil)
+	if dialer.DefaultSocketHook != nil {
+		t.Fatal("expected mihomo dialer socket hook to be cleared")
+	}
+}
+
+func TestProtectTailscaleSocketUsesRawFd(t *testing.T) {
+	protector := &recordingProtector{ok: true}
+
+	if err := protectTailscaleSocketFD(protector, 55); err != nil {
+		t.Fatal(err)
+	}
+	if protector.fd != 55 {
+		t.Fatalf("protected fd = %d, want 55", protector.fd)
+	}
+}
+
+func TestProtectSocketReportsFalseResult(t *testing.T) {
+	protector := &recordingProtector{ok: false}
+
+	err := protectSocket(protector, "tcp", "example.com:443", fakeRawConn{fd: 7})
+	if err == nil {
+		t.Fatal("expected protect error")
+	}
+}
+
+func TestProtectSocketReportsControlError(t *testing.T) {
+	wantErr := errors.New("control failed")
+	err := protectSocket(&recordingProtector{ok: true}, "udp", "1.1.1.1:53", fakeRawConn{err: wantErr})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("error = %v, want wrapping %v", err, wantErr)
+	}
+}
+
 func writeTempFile(t *testing.T, name string, content string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), name)
@@ -95,6 +163,37 @@ func assertScalar(t *testing.T, root *yaml.Node, key string, want string) {
 	if value.Value != want {
 		t.Fatalf("%s = %q, want %q", key, value.Value, want)
 	}
+}
+
+type recordingProtector struct {
+	fd int64
+	ok bool
+}
+
+func (p *recordingProtector) Protect(fd int64) bool {
+	p.fd = fd
+	return p.ok
+}
+
+type fakeRawConn struct {
+	fd  uintptr
+	err error
+}
+
+func (c fakeRawConn) Control(fn func(fd uintptr)) error {
+	if c.err != nil {
+		return c.err
+	}
+	fn(c.fd)
+	return nil
+}
+
+func (c fakeRawConn) Read(func(fd uintptr) bool) error {
+	return syscall.ENOSYS
+}
+
+func (c fakeRawConn) Write(func(fd uintptr) bool) error {
+	return syscall.ENOSYS
 }
 
 func assertSequence(t *testing.T, root *yaml.Node, key string, want []string) {

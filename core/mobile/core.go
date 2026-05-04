@@ -9,6 +9,8 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/metacubex/mihomo/adapter/outbound"
+	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/hub"
@@ -25,10 +27,40 @@ var (
 	lastHome string
 )
 
+type SocketProtector interface {
+	Protect(fd int64) bool
+}
+
 const androidTunMTU = 4064
 const defaultAndroidTunStack = "system"
 const androidTunFakeIPRange = "172.19.0.1/16"
 const androidTunIPv6Address = "fdfe:dcbe:9876::1/126"
+
+func SetSocketProtector(protector SocketProtector) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	if protector == nil {
+		dialer.DefaultSocketHook = nil
+		setTailscaleSocketProtector(nil)
+		log.Warnln("[ClashMiCore] Android socket protector cleared")
+		return
+	}
+	dialer.DefaultSocketHook = func(network, address string, conn syscall.RawConn) error {
+		return protectSocket(protector, network, address, conn)
+	}
+	setTailscaleSocketProtector(protector)
+	log.Infoln("[ClashMiCore] Android socket protector installed for mihomo dialer and Tailscale netns")
+}
+
+func SetAndroidNetworkInfo(raw string) error {
+	if err := outbound.SetAndroidTailscaleNetworkInfo(raw); err != nil {
+		log.Warnln("[ClashMiCore] update Android network info failed: %v", err)
+		return err
+	}
+	log.Infoln("[ClashMiCore] Android network info updated")
+	return nil
+}
 
 func Start(configFile string, patchFile string, finalPatchFile string, homeDir string, tunFd int, externalController string, secret string) error {
 	mu.Lock()
@@ -58,6 +90,9 @@ func Start(configFile string, patchFile string, finalPatchFile string, homeDir s
 	}
 	if running {
 		shutdownLocked()
+	}
+	if dialer.DefaultSocketHook == nil {
+		log.Warnln("[ClashMiCore] Android socket protector is not installed; outbound sockets may route back into VPN")
 	}
 
 	log.Infoln("[ClashMiCore] start config=%s patch=%s finalPatch=%s home=%s fd=%d controller=%s", configFile, patchFile, finalPatchFile, homeDir, tunFd, externalController)
@@ -171,6 +206,33 @@ func shutdownLocked() {
 	statistic.DefaultManager.ResetStatistic()
 	running = false
 	log.Warnln("[ClashMiCore] stopped")
+}
+
+func protectSocket(protector SocketProtector, network string, address string, conn syscall.RawConn) error {
+	var protectErr error
+	if err := conn.Control(func(fd uintptr) {
+		protectErr = protectSocketFD(protector, fd, network, address)
+	}); err != nil {
+		return fmt.Errorf("protect socket control failed network=%s address=%s: %w", network, address, err)
+	}
+	return protectErr
+}
+
+func protectSocketFD(protector SocketProtector, fd uintptr, network string, address string) error {
+	if !protector.Protect(int64(fd)) {
+		protectErr := fmt.Errorf("VpnService.protect returned false for fd=%d network=%s address=%s", fd, network, address)
+		log.Warnln("[ClashMiCore] %v", protectErr)
+		return protectErr
+	}
+	return nil
+}
+
+func protectTailscaleSocketFD(protector SocketProtector, fd int) error {
+	protectErr := protectSocketFD(protector, uintptr(fd), "tailscale-netns", "")
+	if protectErr != nil {
+		return fmt.Errorf("protect Tailscale socket: %w", protectErr)
+	}
+	return nil
 }
 
 func buildRuntimeConfig(configFile string, patchFile string, finalPatchFile string, tunFd int) ([]byte, error) {

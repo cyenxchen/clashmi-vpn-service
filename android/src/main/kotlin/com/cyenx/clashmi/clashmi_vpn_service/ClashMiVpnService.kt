@@ -7,19 +7,29 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import com.cyenx.clashmi.core.clashmicore.Clashmicore
+import com.cyenx.clashmi.core.clashmicore.SocketProtector
 import java.io.File
+import java.net.NetworkInterface
 import java.util.concurrent.atomic.AtomicBoolean
+import org.json.JSONArray
+import org.json.JSONObject
 
 internal class ClashMiVpnService : VpnService() {
     private val stopping = AtomicBoolean(false)
     private var tunFd: Int = -1
     private var tunPfd: ParcelFileDescriptor? = null
     private var worker: Thread? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -59,6 +69,9 @@ internal class ClashMiVpnService : VpnService() {
                 Log.i(TAG, "core starting config=${config.corePath} patch=${config.corePathPatch} finalPatch=${config.corePathPatchFinal}")
                 ClashmiVpnRuntime.updateState("connecting")
                 clearErrorFile(config)
+                installSocketProtector()
+                updateAndroidNetworkInfo("core start")
+                registerNetworkCallback()
                 val fd = openTun(config)
                 tunFd = fd
                 Log.i(TAG, "handing tun fd to core fd=$fd")
@@ -79,6 +92,7 @@ internal class ClashMiVpnService : VpnService() {
                 val message = error.message ?: error.toString()
                 Log.e(TAG, "core start failed: $message", error)
                 writeErrorFile(config, message)
+                unregisterNetworkCallback()
                 closeTunFd()
                 Clashmicore.stop()
                 ClashmiVpnRuntime.updateState("disconnected")
@@ -95,6 +109,7 @@ internal class ClashMiVpnService : VpnService() {
         }
         Log.i(TAG, "core stopping reason=$reason")
         ClashmiVpnRuntime.updateState("disconnecting")
+        unregisterNetworkCallback()
         try {
             Clashmicore.stop()
         } catch (error: Throwable) {
@@ -135,6 +150,143 @@ internal class ClashMiVpnService : VpnService() {
         tunPfd = null
         Log.i(TAG, "tun established fd=$fd")
         return fd
+    }
+
+    private fun installSocketProtector() {
+        Clashmicore.setSocketProtector(
+            object : SocketProtector {
+                override fun protect(fd: Long): Boolean = protectCoreSocket(fd)
+            },
+        )
+        Log.i(TAG, "socket protector installed")
+    }
+
+    private fun protectCoreSocket(fd: Long): Boolean {
+        if (fd < 0 || fd > Int.MAX_VALUE) {
+            Log.w(TAG, "socket protect rejected invalid fd=$fd")
+            return false
+        }
+        val ok = protect(fd.toInt())
+        if (!ok) {
+            Log.w(TAG, "VpnService.protect returned false fd=$fd")
+        }
+        return ok
+    }
+
+    private fun registerNetworkCallback() {
+        if (networkCallback != null) {
+            return
+        }
+        val connectivityManager = getSystemService(ConnectivityManager::class.java)
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                updateAndroidNetworkInfo("network available")
+            }
+
+            override fun onLost(network: Network) {
+                updateAndroidNetworkInfo("network lost")
+            }
+
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                updateAndroidNetworkInfo("link properties changed")
+            }
+
+            override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+                updateAndroidNetworkInfo("network capabilities changed")
+            }
+        }
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+        try {
+            connectivityManager.registerNetworkCallback(request, callback)
+            networkCallback = callback
+            Log.i(TAG, "network callback registered")
+        } catch (error: Throwable) {
+            Log.w(TAG, "register network callback failed: ${error.message}", error)
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        val callback = networkCallback ?: return
+        networkCallback = null
+        try {
+            getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(callback)
+            Log.i(TAG, "network callback unregistered")
+        } catch (error: Throwable) {
+            Log.w(TAG, "unregister network callback ignored: ${error.message}")
+        }
+    }
+
+    private fun updateAndroidNetworkInfo(reason: String) {
+        try {
+            val snapshot = buildAndroidNetworkSnapshot(reason) ?: return
+            Clashmicore.setAndroidNetworkInfo(snapshot.json.toString())
+            Log.i(
+                TAG,
+                "android network info sent reason=$reason default=${snapshot.defaultInterface} interfaces=${snapshot.interfaceCount}",
+            )
+        } catch (error: Throwable) {
+            Log.w(TAG, "send android network info failed reason=$reason error=${error.message}", error)
+        }
+    }
+
+    private fun buildAndroidNetworkSnapshot(reason: String): AndroidNetworkSnapshot? {
+        val connectivityManager = getSystemService(ConnectivityManager::class.java)
+        val activeNetwork = connectivityManager.activeNetwork
+        val candidates = connectivityManager.allNetworks.mapNotNull { network ->
+            val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return@mapNotNull null
+            val linkProperties = connectivityManager.getLinkProperties(network) ?: return@mapNotNull null
+            val interfaceName = linkProperties.interfaceName?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                return@mapNotNull null
+            }
+            if (!capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+                return@mapNotNull null
+            }
+            val addresses = JSONArray()
+            linkProperties.linkAddresses.forEach { address ->
+                addresses.put(address.toString())
+            }
+            if (addresses.length() == 0) {
+                return@mapNotNull null
+            }
+            val payload = JSONObject()
+                .put("name", interfaceName)
+                .put("index", interfaceIndex(interfaceName))
+                .put("mtu", linkProperties.mtu)
+                .put("addresses", addresses)
+            AndroidNetworkCandidate(
+                name = interfaceName,
+                payload = payload,
+                isActive = network == activeNetwork,
+                isValidated = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED),
+            )
+        }
+        if (candidates.isEmpty()) {
+            Log.w(TAG, "no non-vpn internet network info available reason=$reason")
+            val payload = JSONObject()
+                .put("defaultInterface", "")
+                .put("interfaces", JSONArray())
+            return AndroidNetworkSnapshot(payload, "", 0)
+        }
+        val default = candidates.firstOrNull { it.isActive && it.isValidated }
+            ?: candidates.firstOrNull { it.isActive }
+            ?: candidates.firstOrNull { it.isValidated }
+            ?: candidates.first()
+        val interfaces = JSONArray()
+        candidates.forEach { interfaces.put(it.payload) }
+        val payload = JSONObject()
+            .put("defaultInterface", default.name)
+            .put("interfaces", interfaces)
+        return AndroidNetworkSnapshot(payload, default.name, candidates.size)
+    }
+
+    private fun interfaceIndex(name: String): Int = runCatching {
+        NetworkInterface.getByName(name)?.index ?: 0
+    }.getOrElse {
+        Log.w(TAG, "lookup interface index failed name=$name error=${it.message}")
+        0
     }
 
     private fun closeTunFd() {
@@ -251,4 +403,17 @@ internal class ClashMiVpnService : VpnService() {
         private const val TUN_IPV6_PREFIX = 126
         private const val TUN_DNS_SERVER = "172.19.0.2"
     }
+
+    private data class AndroidNetworkCandidate(
+        val name: String,
+        val payload: JSONObject,
+        val isActive: Boolean,
+        val isValidated: Boolean,
+    )
+
+    private data class AndroidNetworkSnapshot(
+        val json: JSONObject,
+        val defaultInterface: String,
+        val interfaceCount: Int,
+    )
 }
