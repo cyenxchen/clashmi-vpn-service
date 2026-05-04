@@ -10,7 +10,8 @@ void main() {
       ..core_path = '/profiles/current.yaml'
       ..secret = 'secret'
       ..prepare = true
-      ..wake_lock = true;
+      ..wake_lock = true
+      ..enable_ipv6 = true;
 
     final restored = VpnServiceConfig()..fromJson(config.toJson());
 
@@ -20,6 +21,7 @@ void main() {
     expect(restored.secret, config.secret);
     expect(restored.prepare, isTrue);
     expect(restored.wake_lock, isTrue);
+    expect(restored.enable_ipv6, isTrue);
   });
 
   test('FlutterVpnServiceState parses known and unknown names', () {

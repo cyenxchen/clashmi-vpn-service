@@ -9,7 +9,7 @@ import (
 )
 
 func TestBuildRuntimeConfigDefaultsToSystemTunStack(t *testing.T) {
-	configFile := writeTempFile(t, "config.yaml", "mixed-port: 7890\n")
+	configFile := writeTempFile(t, "config.yaml", "mixed-port: 7890\nipv6: true\n")
 
 	out, err := buildRuntimeConfig(configFile, "", "", 123)
 	if err != nil {
@@ -22,9 +22,24 @@ func TestBuildRuntimeConfigDefaultsToSystemTunStack(t *testing.T) {
 	assertScalar(t, tun, "stack", defaultAndroidTunStack)
 	assertScalar(t, tun, "auto-route", "false")
 	assertScalar(t, tun, "auto-detect-interface", "false")
+	assertSequence(t, tun, "inet6-address", []string{androidTunIPv6Address})
 
 	dns := readMapping(t, out, "dns")
 	assertScalar(t, dns, "fake-ip-range", androidTunFakeIPRange)
+}
+
+func TestBuildRuntimeConfigDoesNotForceIPv6WhenDisabled(t *testing.T) {
+	configFile := writeTempFile(t, "config.yaml", "mixed-port: 7890\nipv6: false\n")
+
+	out, err := buildRuntimeConfig(configFile, "", "", 321)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tun := readTunMapping(t, out)
+	if value := findValue(tun, "inet6-address"); value != nil {
+		t.Fatalf("inet6-address = %v, want nil when ipv6 is disabled", value.Value)
+	}
 }
 
 func TestBuildRuntimeConfigPreservesRequestedTunStack(t *testing.T) {
@@ -79,5 +94,24 @@ func assertScalar(t *testing.T, root *yaml.Node, key string, want string) {
 	}
 	if value.Value != want {
 		t.Fatalf("%s = %q, want %q", key, value.Value, want)
+	}
+}
+
+func assertSequence(t *testing.T, root *yaml.Node, key string, want []string) {
+	t.Helper()
+	value := findValue(root, key)
+	if value == nil {
+		t.Fatalf("missing key %q", key)
+	}
+	if value.Kind != yaml.SequenceNode {
+		t.Fatalf("%s kind = %v, want sequence", key, value.Kind)
+	}
+	if len(value.Content) != len(want) {
+		t.Fatalf("%s length = %d, want %d", key, len(value.Content), len(want))
+	}
+	for i, item := range value.Content {
+		if item.Value != want[i] {
+			t.Fatalf("%s[%d] = %q, want %q", key, i, item.Value, want[i])
+		}
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
@@ -27,6 +28,7 @@ var (
 const androidTunMTU = 4064
 const defaultAndroidTunStack = "system"
 const androidTunFakeIPRange = "172.19.0.1/16"
+const androidTunIPv6Address = "fdfe:dcbe:9876::1/126"
 
 func Start(configFile string, patchFile string, finalPatchFile string, homeDir string, tunFd int, externalController string, secret string) error {
 	mu.Lock()
@@ -35,7 +37,20 @@ func Start(configFile string, patchFile string, finalPatchFile string, homeDir s
 	if tunFd <= 0 {
 		return errors.New("invalid tun fd")
 	}
+	ownsTunFd := true
+	closeOwnedTunFd := func(reason string) {
+		if !ownsTunFd {
+			return
+		}
+		ownsTunFd = false
+		if closeErr := syscall.Close(tunFd); closeErr != nil {
+			log.Warnln("[ClashMiCore] close tun fd failed reason=%s fd=%d error=%v", reason, tunFd, closeErr)
+			return
+		}
+		log.Warnln("[ClashMiCore] closed tun fd reason=%s fd=%d", reason, tunFd)
+	}
 	if configFile == "" {
+		closeOwnedTunFd("empty config file")
 		return errors.New("empty config file")
 	}
 	if homeDir == "" {
@@ -48,19 +63,23 @@ func Start(configFile string, patchFile string, finalPatchFile string, homeDir s
 	log.Infoln("[ClashMiCore] start config=%s patch=%s finalPatch=%s home=%s fd=%d controller=%s", configFile, patchFile, finalPatchFile, homeDir, tunFd, externalController)
 	configBytes, err := buildRuntimeConfig(configFile, patchFile, finalPatchFile, tunFd)
 	if err != nil {
+		closeOwnedTunFd("build runtime config failed")
 		return err
 	}
 
 	if err = os.Setenv("SAFE_PATHS", homeDir); err != nil {
+		closeOwnedTunFd("set safe paths failed")
 		return err
 	}
 	if err = os.Setenv("SKIP_SAFE_PATH_CHECK", "true"); err != nil {
+		closeOwnedTunFd("set skip safe path check failed")
 		return err
 	}
 
 	C.SetHomeDir(homeDir)
 	C.SetConfig(configFile)
 	if err = config.Init(C.Path.HomeDir()); err != nil {
+		closeOwnedTunFd("init config dir failed")
 		return fmt.Errorf("init mihomo config dir: %w", err)
 	}
 
@@ -71,11 +90,14 @@ func Start(configFile string, patchFile string, finalPatchFile string, homeDir s
 	if secret != "" {
 		options = append(options, hub.WithSecret(secret))
 	}
+	ownsTunFd = false
 	if err = hub.Parse(configBytes, options...); err != nil {
+		executor.Shutdown()
 		return fmt.Errorf("parse/apply mihomo config: %w", err)
 	}
 	tunConf := listener.GetTunConf()
 	if !tunConf.Enable {
+		executor.Shutdown()
 		return fmt.Errorf("mihomo TUN listener did not start (stack=%s fd=%d); make sure the Android core supports the requested stack", tunConf.Stack.String(), tunFd)
 	}
 
@@ -187,6 +209,9 @@ func buildRuntimeConfig(configFile string, patchFile string, finalPatchFile stri
 	if findValue(tun, "dns-hijack") == nil {
 		setSequence(tun, "dns-hijack", []string{"0.0.0.0:53"})
 	}
+	if scalarBool(findValue(root, "ipv6")) && findValue(tun, "inet6-address") == nil {
+		setSequence(tun, "inet6-address", []string{androidTunIPv6Address})
+	}
 
 	dns := ensureMapping(root, "dns")
 	setScalar(dns, "fake-ip-range", androidTunFakeIPRange)
@@ -196,6 +221,13 @@ func buildRuntimeConfig(configFile string, patchFile string, finalPatchFile stri
 		return nil, err
 	}
 	return out, nil
+}
+
+func scalarBool(node *yaml.Node) bool {
+	if node == nil || node.Kind != yaml.ScalarNode {
+		return false
+	}
+	return node.Value == "true"
 }
 
 func readYamlMapping(path string, required bool) (*yaml.Node, error) {

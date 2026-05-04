@@ -10,6 +10,7 @@ internal data class PreparedVpnConfig(
     val name: String,
     val controlPort: Int,
     val secret: String,
+    val enableIPv6: Boolean,
 ) {
     val externalController: String
         get() = if (controlPort > 0) "127.0.0.1:$controlPort" else ""
@@ -31,9 +32,17 @@ internal data class PreparedVpnConfig(
                 name = config.stringValue("name").ifEmpty { "Clash Mi" },
                 controlPort = controlPort,
                 secret = config.stringValue("secret"),
+                enableIPv6 = config.boolValue("enable_ipv6"),
             )
         }
 
         private fun Map<*, *>.stringValue(key: String): String = this[key]?.toString().orEmpty()
+
+        private fun Map<*, *>.boolValue(key: String): Boolean =
+            when (val value = this[key]) {
+                is Boolean -> value
+                is String -> value.equals("true", ignoreCase = true)
+                else -> false
+            }
     }
 }

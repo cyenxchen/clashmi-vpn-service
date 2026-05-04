@@ -114,6 +114,15 @@ internal class ClashMiVpnService : VpnService() {
             .addRoute("0.0.0.0", 0)
             .addDnsServer(TUN_DNS_SERVER)
 
+        if (config.enableIPv6) {
+            builder
+                .addAddress(TUN_IPV6_ADDRESS, TUN_IPV6_PREFIX)
+                .addRoute("::", 0)
+            Log.i(TAG, "ipv6 route enabled address=$TUN_IPV6_ADDRESS/$TUN_IPV6_PREFIX")
+        } else {
+            Log.i(TAG, "ipv6 route disabled by config")
+        }
+
         try {
             builder.addDisallowedApplication(packageName)
             Log.i(TAG, "excluded own package from vpn route: $packageName")
@@ -238,6 +247,8 @@ internal class ClashMiVpnService : VpnService() {
         private const val DEFAULT_MTU = 4064
         private const val TUN_IPV4_ADDRESS = "172.19.0.1"
         private const val TUN_IPV4_PREFIX = 30
+        private const val TUN_IPV6_ADDRESS = "fdfe:dcbe:9876::1"
+        private const val TUN_IPV6_PREFIX = 126
         private const val TUN_DNS_SERVER = "172.19.0.2"
     }
 }

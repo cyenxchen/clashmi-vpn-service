@@ -1,27 +1,23 @@
 package com.cyenx.clashmi.clashmi_vpn_service
 
-import io.flutter.plugin.common.MethodCall
-import io.flutter.plugin.common.MethodChannel
-import org.mockito.Mockito
+import kotlin.test.assertTrue
 import kotlin.test.Test
-
-/*
- * This demonstrates a simple unit test of the Kotlin portion of this plugin's implementation.
- *
- * Once you have built the plugin's example app, you can run these tests from the command
- * line by running `./gradlew testDebugUnitTest` in the `example/android/` directory, or
- * you can run them directly from IDEs that support JUnit such as Android Studio.
- */
 
 internal class ClashmiVpnServicePluginTest {
     @Test
-    fun onMethodCall_getPlatformVersion_returnsExpectedValue() {
-        val plugin = ClashmiVpnServicePlugin()
+    fun preparedVpnConfig_parsesEnableIPv6() {
+        val config = PreparedVpnConfig.fromMethodArguments(
+            mapOf(
+                "config" to mapOf(
+                    "base_dir" to "/data/user/0/com.nebula.clashmi/files",
+                    "core_path" to "/profiles/current.yaml",
+                    "name" to "Clash Mi",
+                    "control_port" to 9090,
+                    "enable_ipv6" to true,
+                ),
+            ),
+        )
 
-        val call = MethodCall("getPlatformVersion", null)
-        val mockResult: MethodChannel.Result = Mockito.mock(MethodChannel.Result::class.java)
-        plugin.onMethodCall(call, mockResult)
-
-        Mockito.verify(mockResult).success("Android " + android.os.Build.VERSION.RELEASE)
+        assertTrue(config.enableIPv6)
     }
 }

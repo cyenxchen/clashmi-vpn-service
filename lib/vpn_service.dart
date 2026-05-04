@@ -79,6 +79,7 @@ class VpnServiceConfig {
   bool prepare = false;
   bool wake_lock = false;
   bool auto_connect_at_boot = false;
+  bool enable_ipv6 = false;
 
   void fromJson(Map<String, Object?> json) {
     control_port = (json['control_port'] as num?)?.toInt() ?? 0;
@@ -98,6 +99,7 @@ class VpnServiceConfig {
     prepare = json['prepare'] == true;
     wake_lock = json['wake_lock'] == true;
     auto_connect_at_boot = json['auto_connect_at_boot'] == true;
+    enable_ipv6 = json['enable_ipv6'] == true;
   }
 
   Map<String, Object?> toJson() => {
@@ -118,6 +120,7 @@ class VpnServiceConfig {
     'prepare': prepare,
     'wake_lock': wake_lock,
     'auto_connect_at_boot': auto_connect_at_boot,
+    'enable_ipv6': enable_ipv6,
   };
 }
 
@@ -229,6 +232,11 @@ class FlutterVpnService {
     String method,
     Duration timeout,
   ) async {
+    if (!Platform.isAndroid) {
+      return VpnServiceWaitResult.error(
+        'clashmi_vpn_service currently supports Android only',
+      );
+    }
     final result = await _invoke<Map>(method, {
       'timeoutMillis': timeout.inMilliseconds,
     });
