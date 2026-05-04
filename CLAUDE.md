@@ -59,7 +59,3 @@ unzip -p android/src/main/libs/clashmicore.aar jni/arm64-v8a/libgojni.so \
 
 - 修改 Go 代码后,**生成的 `clashmicore.aar` / `clashmicore.jar` / `libgojni.so` 也需要一并提交**(Gradle 直接消费它们,Clash Mi app 通过 path 依赖引用本仓库)。
 - 上游应用 Clash Mi 通过相对路径 `../clashmi-vpn-service` 引用本插件;改动 Dart API 时记得同步上游调用点。
-
-## 可参考文档
-
-`@CODEX_HANDOFF.md` — 详细的初版交接文档,包含历史 bug 复盘(gVisor 未启动、TUN 地址不匹配、fdsan)、最近一次真机验证记录、以及待办(Kotlin 测试 harness、可配置 TUN 地址、iOS 实现、多架构)。
