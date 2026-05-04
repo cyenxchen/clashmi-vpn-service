@@ -104,6 +104,15 @@ internal class ClashMiVpnService : VpnService() {
     }
 
     private fun stopCore(reason: String) {
+        if (worker?.isAlive != true &&
+            tunFd < 0 &&
+            tunPfd == null &&
+            ClashmiVpnRuntime.currentState == "disconnected"
+        ) {
+            Log.i(TAG, "core stop ignored: already disconnected reason=$reason")
+            stopSelf()
+            return
+        }
         if (!stopping.compareAndSet(false, true)) {
             return
         }
