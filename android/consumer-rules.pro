@@ -1,0 +1,4 @@
+-keep class com.cyenx.clashmi.clashmi_vpn_service.ClashmiVpnServicePlugin
+-keep class com.cyenx.clashmi.clashmi_vpn_service.ClashMiVpnService
+-keep class com.cyenx.clashmi.core.** { *; }
+-keep class go.** { *; }
