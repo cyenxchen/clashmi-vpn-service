@@ -23,6 +23,9 @@ var (
 
 	tailscaleProxyMu          sync.RWMutex
 	tailscaleProxyURL         string
+	tailscaleSocketProtector  SocketProtector
+	tailscaleNetnsProtected   bool
+	tailscaleNetnsProxyURL    string
 	tailscaleProxyInstallOnce sync.Once
 	tailscaleProxyInstallErr  error
 	tailscaleProxySelectCount atomic.Uint64
@@ -35,10 +38,10 @@ type androidNetworkDNSInfo struct {
 }
 
 func setTailscaleSocketProtector(protector SocketProtector) {
-	netns.SetAndroidProtectFunc(nil)
-	if protector != nil {
-		log.Infoln("[ClashMiCore] Tailscale Android netns protector disabled; Tailscale self traffic remains inside VPN for Mihomo routing")
-	}
+	tailscaleProxyMu.Lock()
+	tailscaleSocketProtector = protector
+	applyTailscaleNetnsProtectorLocked()
+	tailscaleProxyMu.Unlock()
 }
 
 func setTailscaleAndroidDNSServersFromRaw(raw string) bool {
@@ -80,18 +83,31 @@ func setTailscaleAndroidDNSServersFromRaw(raw string) bool {
 func setTailscaleControlHTTPProxy(proxyURL string) {
 	proxyURL = strings.TrimSpace(proxyURL)
 
-	tailscaleProxyMu.Lock()
-	changed := tailscaleProxyURL != proxyURL
-	tailscaleProxyURL = proxyURL
-	tailscaleProxyMu.Unlock()
-
+	// The proxy hook must be installed before enabling the Android netns protector.
+	//
+	// Tailscale's control client asks tshttpproxy for an HTTP proxy before it
+	// dials controlplane.tailscale.com. If the hook is missing while netns
+	// protection is enabled, Android's VpnService.protect would let the
+	// controlplane socket escape the VPN and bypass Mihomo rules. That is the
+	// old registration regression this guard is meant to prevent.
 	tailscaleProxyInstallOnce.Do(func() {
 		tailscaleProxyInstallErr = tshttpproxy.SetProxyFunc(tailscaleProxyFromConfig)
 	})
 	if tailscaleProxyInstallErr != nil {
 		log.Warnln("[ClashMiCore] install Tailscale control proxy hook failed: %v", tailscaleProxyInstallErr)
+		tailscaleProxyMu.Lock()
+		tailscaleProxyURL = ""
+		applyTailscaleNetnsProtectorLocked()
+		tailscaleProxyMu.Unlock()
 		return
 	}
+
+	tailscaleProxyMu.Lock()
+	changed := tailscaleProxyURL != proxyURL
+	tailscaleProxyURL = proxyURL
+	applyTailscaleNetnsProtectorLocked()
+	tailscaleProxyMu.Unlock()
+
 	if !changed {
 		return
 	}
@@ -100,6 +116,56 @@ func setTailscaleControlHTTPProxy(proxyURL string) {
 		return
 	}
 	log.Infoln("[ClashMiCore] Tailscale control proxy set to %s", redactedProxyURL(proxyURL))
+}
+
+func applyTailscaleNetnsProtectorLocked() {
+	// Keep this helper as the single place that decides whether Tailscale's
+	// Android netns hook is active.
+	//
+	// There are two competing requirements:
+	//   1. controlplane.tailscale.com registration must be able to go through
+	//      Mihomo, so user proxy rules can decide how Tailscale logs in.
+	//   2. Tailscale's peer/DERP/netcheck sockets need Android VPN protection
+	//      when possible, otherwise mobile networks with usable IPv6 may still
+	//      look non-direct and fall back to DERP relay.
+	//
+	// The safe compromise is conditional: enable netns protection only after
+	// the Tailscale HTTP proxy hook points control traffic at the local Mihomo
+	// HTTP proxy. Do not change this to an unconditional SetAndroidProtectFunc
+	// install, because that can bypass Mihomo for registration. Do not change it
+	// back to unconditional nil either, because that breaks direct path probing.
+	if tailscaleSocketProtector == nil {
+		netns.SetAndroidProtectFunc(nil)
+		if tailscaleNetnsProtected {
+			log.Warnln("[ClashMiCore] Tailscale Android netns protector cleared")
+		}
+		tailscaleNetnsProtected = false
+		tailscaleNetnsProxyURL = ""
+		return
+	}
+
+	if tailscaleProxyURL == "" {
+		netns.SetAndroidProtectFunc(nil)
+		if tailscaleNetnsProtected {
+			log.Warnln("[ClashMiCore] Tailscale Android netns protector disabled; no local control proxy is configured")
+		} else {
+			log.Infoln("[ClashMiCore] Tailscale Android netns protector deferred; keeping Tailscale control traffic inside VPN until a local control proxy is configured")
+		}
+		tailscaleNetnsProtected = false
+		tailscaleNetnsProxyURL = ""
+		return
+	}
+
+	protector := tailscaleSocketProtector
+	proxyURL := tailscaleProxyURL
+	netns.SetAndroidProtectFunc(func(fd int) error {
+		return protectSocketFD(protector, uintptr(fd), "tailscale-netns", "")
+	})
+	if !tailscaleNetnsProtected || tailscaleNetnsProxyURL != proxyURL {
+		log.Infoln("[ClashMiCore] Tailscale Android netns protector installed for peer/DERP path discovery; control proxy=%s", redactedProxyURL(proxyURL))
+	}
+	tailscaleNetnsProtected = true
+	tailscaleNetnsProxyURL = proxyURL
 }
 
 func tailscaleProxyFromConfig(target *url.URL) (*url.URL, error) {
