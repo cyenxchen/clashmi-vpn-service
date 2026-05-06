@@ -147,12 +147,10 @@ internal class ClashMiVpnService : VpnService() {
             Log.i(TAG, "ipv6 route disabled by config")
         }
 
-        try {
-            builder.addDisallowedApplication(packageName)
-            Log.i(TAG, "excluded own package from vpn route: $packageName")
-        } catch (error: Throwable) {
-            Log.w(TAG, "exclude own package failed: ${error.message}", error)
-        }
+        Log.i(
+            TAG,
+            "own package remains inside vpn route; core outbound sockets are protected individually",
+        )
 
         tunPfd = builder.establish() ?: error("VpnService.Builder.establish returned null")
         val fd = tunPfd!!.detachFd()
@@ -260,11 +258,16 @@ internal class ClashMiVpnService : VpnService() {
             if (addresses.length() == 0) {
                 return@mapNotNull null
             }
+            val dnsServers = JSONArray()
+            linkProperties.dnsServers.forEach { server ->
+                dnsServers.put(server.hostAddress)
+            }
             val payload = JSONObject()
                 .put("name", interfaceName)
                 .put("index", interfaceIndex(interfaceName))
                 .put("mtu", linkProperties.mtu)
                 .put("addresses", addresses)
+                .put("dnsServers", dnsServers)
             AndroidNetworkCandidate(
                 name = interfaceName,
                 payload = payload,
