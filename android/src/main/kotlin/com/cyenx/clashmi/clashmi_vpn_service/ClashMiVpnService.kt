@@ -60,14 +60,14 @@ internal class ClashMiVpnService : VpnService() {
         stopping.set(false)
         startForegroundService()
         worker = Thread({
-            val config = ClashmiVpnRuntime.preparedConfig
+            val config = ClashmiVpnRuntime.preparedConfig ?: restorePreparedConfig()
             if (config == null) {
                 failStart("missing prepared config")
                 return@Thread
             }
             try {
                 Log.i(TAG, "core starting config=${config.corePath} patch=${config.corePathPatch} finalPatch=${config.corePathPatchFinal}")
-                ClashmiVpnRuntime.updateState("connecting")
+                updateState("connecting")
                 clearErrorFile(config)
                 installSocketProtector()
                 updateAndroidNetworkInfo("core start")
@@ -86,7 +86,7 @@ internal class ClashMiVpnService : VpnService() {
                     config.secret,
                 )
                 Log.i(TAG, "core started fd=$fd controller=${config.externalController} tun=${Clashmicore.tunInfo()}")
-                ClashmiVpnRuntime.updateState("connected")
+                updateState("connected")
                 ClashmiVpnRuntime.completeStart(ClashmiVpnRuntime.doneResult())
             } catch (error: Throwable) {
                 val message = error.message ?: error.toString()
@@ -95,7 +95,7 @@ internal class ClashMiVpnService : VpnService() {
                 unregisterNetworkCallback()
                 closeTunFd()
                 Clashmicore.stop()
-                ClashmiVpnRuntime.updateState("disconnected")
+                updateState("disconnected")
                 ClashmiVpnRuntime.completeStart(ClashmiVpnRuntime.errorResult(message))
                 stopSelf()
             }
@@ -117,7 +117,7 @@ internal class ClashMiVpnService : VpnService() {
             return
         }
         Log.i(TAG, "core stopping reason=$reason")
-        ClashmiVpnRuntime.updateState("disconnecting")
+        updateState("disconnecting")
         unregisterNetworkCallback()
         try {
             Clashmicore.stop()
@@ -125,7 +125,7 @@ internal class ClashMiVpnService : VpnService() {
             Log.w(TAG, "core stop failed: ${error.message}", error)
         }
         closeTunFd()
-        ClashmiVpnRuntime.updateState("disconnected")
+        updateState("disconnected")
         stopForegroundCompat()
         stopSelf()
     }
@@ -138,13 +138,17 @@ internal class ClashMiVpnService : VpnService() {
             .addRoute("0.0.0.0", 0)
             .addDnsServer(TUN_DNS_SERVER)
 
-        if (config.enableIPv6) {
+        val enableIPv6Route = resolveEffectiveIPv6(config)
+        if (enableIPv6Route) {
             builder
                 .addAddress(TUN_IPV6_ADDRESS, TUN_IPV6_PREFIX)
                 .addRoute("::", 0)
-            Log.i(TAG, "ipv6 route enabled address=$TUN_IPV6_ADDRESS/$TUN_IPV6_PREFIX")
+            Log.i(
+                TAG,
+                "ipv6 route enabled address=$TUN_IPV6_ADDRESS/$TUN_IPV6_PREFIX serviceConfig=${config.enableIPv6}",
+            )
         } else {
-            Log.i(TAG, "ipv6 route disabled by config")
+            Log.i(TAG, "ipv6 route disabled by effective config serviceConfig=${config.enableIPv6}")
         }
 
         Log.i(
@@ -157,6 +161,30 @@ internal class ClashMiVpnService : VpnService() {
         tunPfd = null
         Log.i(TAG, "tun established fd=$fd")
         return fd
+    }
+
+    private fun resolveEffectiveIPv6(config: PreparedVpnConfig): Boolean {
+        return try {
+            val enabled = Clashmicore.effectiveIPv6(
+                config.corePath,
+                config.corePathPatch,
+                config.corePathPatchFinal,
+            )
+            if (enabled != config.enableIPv6) {
+                Log.i(
+                    TAG,
+                    "ipv6 route config differs from service.json effective=$enabled serviceConfig=${config.enableIPv6}",
+                )
+            }
+            enabled
+        } catch (error: Throwable) {
+            Log.w(
+                TAG,
+                "resolve effective ipv6 failed; fallback serviceConfig=${config.enableIPv6}: ${error.message}",
+                error,
+            )
+            config.enableIPv6
+        }
     }
 
     private fun installSocketProtector() {
@@ -323,9 +351,32 @@ internal class ClashMiVpnService : VpnService() {
 
     private fun failStart(message: String) {
         Log.e(TAG, message)
-        ClashmiVpnRuntime.updateState("disconnected")
+        updateState("disconnected")
         ClashmiVpnRuntime.completeStart(ClashmiVpnRuntime.errorResult(message))
         stopSelf()
+    }
+
+    private fun updateState(state: String, params: Map<String, String> = emptyMap()) {
+        ClashmiVpnRuntime.updateState(state, params)
+        val intent = Intent(ACTION_STATE_CHANGED)
+            .setPackage(packageName)
+            .putExtra(EXTRA_STATE, state)
+        params.forEach { (key, value) -> intent.putExtra(key, value) }
+        sendBroadcast(intent)
+        Log.i(TAG, "state broadcast state=$state")
+    }
+
+    private fun restorePreparedConfig(): PreparedVpnConfig? {
+        val configFile = File(filesDir, SERVICE_CONFIG_FILE_NAME)
+        return runCatching {
+            PreparedVpnConfig.fromConfigFile(configFile)?.also {
+                ClashmiVpnRuntime.setPreparedConfig(it)
+                Log.i(TAG, "prepared config restored from ${configFile.absolutePath}")
+            }
+        }.getOrElse {
+            Log.w(TAG, "restore prepared config failed path=${configFile.absolutePath}: ${it.message}", it)
+            null
+        }
     }
 
     private fun startForegroundService() {
@@ -405,7 +456,10 @@ internal class ClashMiVpnService : VpnService() {
     companion object {
         const val ACTION_START = "com.cyenx.clashmi.clashmi_vpn_service.START"
         const val ACTION_STOP = "com.cyenx.clashmi.clashmi_vpn_service.STOP"
+        const val ACTION_STATE_CHANGED = "com.cyenx.clashmi.clashmi_vpn_service.STATE_CHANGED"
+        const val EXTRA_STATE = "state"
         private const val TAG = "ClashMiVpnService"
+        private const val SERVICE_CONFIG_FILE_NAME = "service.json"
         private const val CHANNEL_ID = "clashmi_vpn"
         private const val NOTIFICATION_ID = 6210
         private const val DEFAULT_MTU = 4064

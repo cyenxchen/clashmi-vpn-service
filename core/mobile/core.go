@@ -622,27 +622,9 @@ func buildRuntimeConfig(configFile string, patchFile string, finalPatchFile stri
 }
 
 func buildRuntimeConfigWithMetadata(configFile string, patchFile string, finalPatchFile string, tunFd int) (*runtimeConfigBuild, error) {
-	root, err := readYamlMapping(configFile, true)
+	root, err := readMergedConfigRoot(configFile, patchFile, finalPatchFile)
 	if err != nil {
-		return nil, fmt.Errorf("read config %s: %w", configFile, err)
-	}
-	if patchFile != "" {
-		patch, patchErr := readYamlMapping(patchFile, false)
-		if patchErr != nil {
-			return nil, fmt.Errorf("read patch %s: %w", patchFile, patchErr)
-		}
-		if patch != nil {
-			mergeMapping(root, patch)
-		}
-	}
-	if finalPatchFile != "" {
-		patch, patchErr := readYamlMapping(finalPatchFile, false)
-		if patchErr != nil {
-			return nil, fmt.Errorf("read final patch %s: %w", finalPatchFile, patchErr)
-		}
-		if patch != nil {
-			mergeMapping(root, patch)
-		}
+		return nil, err
 	}
 
 	tun := ensureMapping(root, "tun")
@@ -677,6 +659,14 @@ func buildRuntimeConfigWithMetadata(configFile string, patchFile string, finalPa
 		data:                   out,
 		injectedDNSPolicyHosts: injectedDNSPolicyHosts,
 	}, nil
+}
+
+func EffectiveIPv6(configFile string, patchFile string, finalPatchFile string) (bool, error) {
+	root, err := readMergedConfigRoot(configFile, patchFile, finalPatchFile)
+	if err != nil {
+		return false, err
+	}
+	return scalarBool(findValue(root, "ipv6")), nil
 }
 
 func logTailscaleControlRoutingConfig(root *yaml.Node, proxyURL string) {
@@ -1008,6 +998,32 @@ func scalarBool(node *yaml.Node) bool {
 		return false
 	}
 	return node.Value == "true"
+}
+
+func readMergedConfigRoot(configFile string, patchFile string, finalPatchFile string) (*yaml.Node, error) {
+	root, err := readYamlMapping(configFile, true)
+	if err != nil {
+		return nil, fmt.Errorf("read config %s: %w", configFile, err)
+	}
+	if patchFile != "" {
+		patch, patchErr := readYamlMapping(patchFile, false)
+		if patchErr != nil {
+			return nil, fmt.Errorf("read patch %s: %w", patchFile, patchErr)
+		}
+		if patch != nil {
+			mergeMapping(root, patch)
+		}
+	}
+	if finalPatchFile != "" {
+		patch, patchErr := readYamlMapping(finalPatchFile, false)
+		if patchErr != nil {
+			return nil, fmt.Errorf("read final patch %s: %w", finalPatchFile, patchErr)
+		}
+		if patch != nil {
+			mergeMapping(root, patch)
+		}
+	}
+	return root, nil
 }
 
 func readYamlMapping(path string, required bool) (*yaml.Node, error) {

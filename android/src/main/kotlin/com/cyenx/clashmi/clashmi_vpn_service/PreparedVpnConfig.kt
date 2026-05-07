@@ -1,5 +1,8 @@
 package com.cyenx.clashmi.clashmi_vpn_service
 
+import java.io.File
+import org.json.JSONObject
+
 internal data class PreparedVpnConfig(
     val baseDir: String,
     val corePath: String,
@@ -19,6 +22,18 @@ internal data class PreparedVpnConfig(
         fun fromMethodArguments(args: Map<*, *>): PreparedVpnConfig {
             val config = args["config"] as? Map<*, *>
                 ?: error("missing config")
+            return fromConfigMap(config)
+        }
+
+        fun fromConfigFile(file: File): PreparedVpnConfig? {
+            if (!file.isFile) {
+                return null
+            }
+            val json = JSONObject(file.readText())
+            return fromConfigMap(json.toMap())
+        }
+
+        private fun fromConfigMap(config: Map<*, *>): PreparedVpnConfig {
             val controlPort = (config["control_port"] as? Number)?.toInt()
                 ?: config["control_port"]?.toString()?.toIntOrNull()
                 ?: 0
@@ -44,5 +59,15 @@ internal data class PreparedVpnConfig(
                 is String -> value.equals("true", ignoreCase = true)
                 else -> false
             }
+
+        private fun JSONObject.toMap(): Map<String, Any?> {
+            val map = mutableMapOf<String, Any?>()
+            val keys = keys()
+            while (keys.hasNext()) {
+                val key = keys.next()
+                map[key] = opt(key)
+            }
+            return map
+        }
     }
 }

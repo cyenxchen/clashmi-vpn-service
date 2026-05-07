@@ -55,6 +55,8 @@ unzip -p android/src/main/libs/clashmicore.aar jni/arm64-v8a/libgojni.so \
 
 4. **`core/mihomo` 是 submodule**(指向 `cyenxchen/mihomo` Meta 分支)。clone 后需要 `git submodule update --init --recursive`,升级时谨慎。
 
+   本地开发时,同级目录通常并存一份独立工作副本 `../mihomo`,与该 submodule 同源(同一 `cyenxchen/mihomo` fork,fork 自 `MetaCubeX/mihomo` 上游)。改 mihomo 代码的常见流程:在 `../mihomo` 中开发并提交 → 推到 `cyenxchen/mihomo` Meta 分支 → 回到本仓库 `cd core/mihomo && git fetch && git checkout <commit>`(或 `git submodule update --remote core/mihomo`)→ 重新跑「构建链」段落里的 gomobile bind / 解包步骤 → 提交 submodule 指针与 AAR/JAR/SO 产物。
+
 ## 提交与发布
 
 - 修改 Go 代码后,**生成的 `clashmicore.aar` / `clashmicore.jar` / `libgojni.so` 也需要一并提交**(Gradle 直接消费它们,Clash Mi app 通过 path 依赖引用本仓库)。

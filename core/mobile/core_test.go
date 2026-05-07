@@ -50,6 +50,32 @@ func TestBuildRuntimeConfigDoesNotForceIPv6WhenDisabled(t *testing.T) {
 	}
 }
 
+func TestEffectiveIPv6UsesMergedConfig(t *testing.T) {
+	configFile := writeTempFile(t, "config.yaml", "mixed-port: 7890\nipv6: false\n")
+	patchFile := writeTempFile(t, "patch.yaml", "ipv6: true\n")
+
+	enabled, err := EffectiveIPv6(configFile, patchFile, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !enabled {
+		t.Fatal("EffectiveIPv6 = false, want true from merged patch")
+	}
+}
+
+func TestEffectiveIPv6HonorsFinalPatchOverride(t *testing.T) {
+	configFile := writeTempFile(t, "config.yaml", "mixed-port: 7890\nipv6: true\n")
+	finalPatchFile := writeTempFile(t, "final.json", "{\n  \"ipv6\": false\n}\n")
+
+	enabled, err := EffectiveIPv6(configFile, "", finalPatchFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if enabled {
+		t.Fatal("EffectiveIPv6 = true, want false from final patch")
+	}
+}
+
 func TestBuildRuntimeConfigPreservesRequestedTunStack(t *testing.T) {
 	configFile := writeTempFile(t, "config.yaml", "mixed-port: 7890\ndns:\n  fake-ip-range: 198.18.0.8/16\n")
 	patchFile := writeTempFile(t, "patch.yaml", "tun:\n  stack: gvisor\n")
