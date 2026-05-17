@@ -6,6 +6,7 @@ require (
 	github.com/metacubex/mihomo v0.0.0
 	golang.org/x/mobile v0.0.0-20260410095206-2cfb76559b7b
 	gopkg.in/yaml.v3 v3.0.1
+	tailscale.com v1.96.5
 )
 
 require (
@@ -153,7 +154,6 @@ require (
 	golang.zx2c4.com/wireguard/windows v0.5.3 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gvisor.dev/gvisor v0.0.0-20260224225140-573d5e7127a8 // indirect
-	tailscale.com v1.96.5 // indirect
 )
 
 replace github.com/metacubex/mihomo => ../mihomo
