@@ -14,7 +14,6 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/metacubex/mihomo/adapter/outbound"
 	"github.com/metacubex/mihomo/component/dialer"
 	mihomoResolver "github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/component/trie"
@@ -72,10 +71,6 @@ func SetSocketProtector(protector SocketProtector) {
 
 func SetAndroidNetworkInfo(raw string) error {
 	dnsChanged := setTailscaleAndroidDNSServersFromRaw(raw)
-	if err := outbound.SetAndroidTailscaleNetworkInfo(raw); err != nil {
-		log.Warnln("[ClashMiCore] update Android network info failed: %v", err)
-		return err
-	}
 	if dnsChanged {
 		if err := refreshAndroidTailscaleDNSPolicy(); err != nil {
 			log.Warnln("[ClashMiCore] refresh Android physical DNS policy failed: %v", err)
