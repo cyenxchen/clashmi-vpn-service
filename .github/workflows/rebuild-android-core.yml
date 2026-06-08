@@ -65,6 +65,14 @@ jobs:
           go-version: "1.26"
           cache-dependency-path: core/mobile/go.sum
 
+      - name: Sync Go module metadata
+        working-directory: core/mobile
+        run: |
+          set -euo pipefail
+          echo "Tidying core/mobile against mihomo $(git -C ../mihomo rev-parse --short HEAD)"
+          go mod tidy
+          git diff --stat -- go.mod go.sum || true
+
       - name: Install gomobile
         working-directory: core/mobile
         run: |
