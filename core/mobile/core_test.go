@@ -5,11 +5,13 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"syscall"
 	"testing"
 
 	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/component/dialer"
+	mihomoResolver "github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
 	mihomoDNS "github.com/metacubex/mihomo/dns"
@@ -393,6 +395,45 @@ func TestReplaceDNSPoliciesForHostsRemovesInjectedPoliciesWithoutServers(t *test
 		t.Fatalf("policy count = %d, want 1", len(got))
 	}
 	assertPolicyNameserver(t, got[0], "private.example", "private.example/dns-query")
+}
+
+func TestApplyRuntimeDNSConfigInitializesAndStopsDNSService(t *testing.T) {
+	// An empty listen address exercises resolver setup without binding host sockets.
+	dnsConfig := &config.DNS{
+		Enable: true,
+		NameServer: []mihomoDNS.NameServer{{
+			Net:  "udp",
+			Addr: "1.1.1.1:53",
+		}},
+		Fallback: []mihomoDNS.NameServer{{
+			Net:  "udp",
+			Addr: "8.8.8.8:53",
+		}},
+		FallbackLazyQuery: true,
+	}
+	t.Cleanup(func() {
+		applyRuntimeDNSConfig(&config.DNS{}, false)
+	})
+
+	applyRuntimeDNSConfig(dnsConfig, false)
+	if mihomoResolver.DefaultService == nil {
+		t.Fatal("default DNS service is nil after enabling runtime DNS")
+	}
+	resolvers, ok := mihomoResolver.DefaultResolver.(mihomoDNS.Resolvers)
+	if !ok {
+		t.Fatalf("default resolver type = %T, want dns.Resolvers", mihomoResolver.DefaultResolver)
+	}
+	// mihomo does not expose this resolver option, so inspect it directly to
+	// guard the wrapper's config mapping during upstream API upgrades.
+	lazyQuery := reflect.ValueOf(resolvers.Resolver).Elem().FieldByName("fallbackLazyQuery").Bool()
+	if !lazyQuery {
+		t.Fatal("fallback lazy query = false, want true from runtime DNS config")
+	}
+
+	applyRuntimeDNSConfig(&config.DNS{}, false)
+	if mihomoResolver.DefaultService != nil {
+		t.Fatal("default DNS service remains set after disabling runtime DNS")
+	}
 }
 
 func TestSyncRuntimeConfigStateFromAppliedConfigRefreshesDNSCache(t *testing.T) {

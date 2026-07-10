@@ -14,6 +14,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/metacubex/mihomo/adapter/inbound"
 	"github.com/metacubex/mihomo/component/dialer"
 	mihomoResolver "github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/component/trie"
@@ -525,7 +526,8 @@ func applyRuntimeDNSConfig(c *config.DNS, generalIPv6 bool) {
 		mihomoResolver.DefaultService = nil
 		mihomoResolver.ProxyServerHostResolver = nil
 		mihomoResolver.DirectHostResolver = nil
-		mihomoDNS.ReCreateServer("", nil)
+		log.Infoln("[ClashMiCore] runtime DNS disabled; stopping embedded DNS listener")
+		mihomoDNS.ReCreateServer("", nil, nil)
 		return
 	}
 
@@ -537,6 +539,7 @@ func applyRuntimeDNSConfig(c *config.DNS, generalIPv6 bool) {
 		IPv6Timeout:          c.IPv6Timeout,
 		FallbackIPFilter:     c.FallbackIPFilter,
 		FallbackDomainFilter: c.FallbackDomainFilter,
+		FallbackLazyQuery:    c.FallbackLazyQuery,
 		Default:              c.DefaultNameserver,
 		Policy:               c.NameServerPolicy,
 		ProxyServer:          c.ProxyServerNameserver,
@@ -581,7 +584,12 @@ func applyRuntimeDNSConfig(c *config.DNS, generalIPv6 bool) {
 		mihomoResolver.DirectHostResolver = r.Resolver
 	}
 
-	mihomoDNS.ReCreateServer(c.Listen, s)
+	// Delegate socket creation to mihomo's inbound config so DNS routing marks
+	// and listener socket options stay aligned with the core executor path.
+	lc := inbound.NewListenConfig()
+	lc.SetRouteMark(c.ListenRoutingMark)
+	log.Infoln("[ClashMiCore] applying runtime DNS listen=%s routingMark=%d", c.Listen, c.ListenRoutingMark)
+	mihomoDNS.ReCreateServer(c.Listen, lc, s)
 }
 
 func protectSocket(protector SocketProtector, network string, address string, conn syscall.RawConn) error {
