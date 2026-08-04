@@ -74,14 +74,8 @@ class ClashmiVpnServicePlugin :
                 }
             }
             "start" -> start(result, timeoutMillis(call))
-            "restart" -> {
-                stopService()
-                start(result, timeoutMillis(call))
-            }
-            "stop" -> {
-                stopService()
-                result.success(null)
-            }
+            "restart" -> stop(result, timeoutMillis(call), restartAfterStop = true)
+            "stop" -> stop(result, timeoutMillis(call), restartAfterStop = false)
             "clashiApiTraffic" -> result.success(Clashmicore.traffic())
             "clashiApiConnections" ->
                 result.success(Clashmicore.connections(connectionListEnabled(call)))
@@ -202,14 +196,46 @@ class ClashmiVpnServicePlugin :
         }
     }
 
-    private fun stopService() {
+    private fun stop(result: Result, timeoutMillis: Long, restartAfterStop: Boolean) {
+        if (!ClashmiVpnRuntime.beginStop { waitResult ->
+                mainHandler.post {
+                    if (restartAfterStop && waitResult["type"] == "done") {
+                        Log.i(tag, "vpn stop completed; starting restart")
+                        start(result, timeoutMillis)
+                    } else {
+                        result.success(waitResult)
+                    }
+                }
+            }) {
+            result.success(ClashmiVpnRuntime.errorResult("VPN stop already pending", isCloseError = true))
+            return
+        }
+
+        val timeout = if (timeoutMillis > 0) timeoutMillis else DEFAULT_TIMEOUT_MILLIS
+        mainHandler.postDelayed({
+            if (ClashmiVpnRuntime.completeStop(ClashmiVpnRuntime.timeoutResult("service stop timeout"))) {
+                Log.w(tag, "vpn stop timeout restart=$restartAfterStop")
+            }
+        }, timeout)
+
+        if (!stopService()) {
+            ClashmiVpnRuntime.completeStop(
+                ClashmiVpnRuntime.errorResult("failed to send VPN stop intent", isCloseError = true),
+            )
+        }
+    }
+
+    private fun stopService(): Boolean {
         val intent = Intent(context, ClashMiVpnService::class.java).setAction(ClashMiVpnService.ACTION_STOP)
-        try {
+        return try {
             context.startService(intent)
+            Log.i(tag, "stop service intent sent")
+            true
         } catch (error: Throwable) {
-            Log.w(tag, "stop service intent failed: ${error.message}", error)
-            Clashmicore.stop()
-            ClashmiVpnRuntime.updateState("disconnected")
+            // Never run the potentially blocking Go shutdown on Flutter's main
+            // thread. Return an error and retain the observable native state.
+            Log.e(tag, "stop service intent failed: ${error.message}", error)
+            false
         }
     }
 

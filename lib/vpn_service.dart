@@ -246,8 +246,12 @@ class FlutterVpnService {
     return VpnServiceWaitResult.fromJson(Map<String, Object?>.from(result));
   }
 
-  static Future<void> stop() async {
-    await _invoke<void>('stop');
+  static Future<VpnServiceWaitResult> stop([
+    Duration timeout = const Duration(seconds: 30),
+  ]) async {
+    // Android replies only after native listeners and the TUN interface have
+    // finished shutting down; callers must not treat an enqueued intent as done.
+    return _waitResult('stop', timeout);
   }
 
   static Future<String> clashiApiTraffic() async {

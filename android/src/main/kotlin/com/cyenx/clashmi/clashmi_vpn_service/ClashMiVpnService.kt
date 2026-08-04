@@ -20,114 +20,238 @@ import com.cyenx.clashmi.core.clashmicore.Clashmicore
 import com.cyenx.clashmi.core.clashmicore.SocketProtector
 import java.io.File
 import java.net.NetworkInterface
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
 import org.json.JSONArray
 import org.json.JSONObject
 
 internal class ClashMiVpnService : VpnService() {
-    private val stopping = AtomicBoolean(false)
+    private val desiredRunning = AtomicBoolean(false)
+    private val lifecycleExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "ClashMiVpnLifecycle")
+    }
+    @Volatile
+    private var coreRunning = false
     private var tunFd: Int = -1
     private var tunPfd: ParcelFileDescriptor? = null
-    private var worker: Thread? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_STOP -> stopCore("stop action")
-            ACTION_START, null -> startCore()
-            else -> Log.w(TAG, "unknown action=${intent.action}")
+            ACTION_START -> {
+                desiredRunning.set(true)
+                lifecycleLog("I", "start requested startId=$startId state=${ClashmiVpnRuntime.currentState}")
+                try {
+                    // Every startForegroundService request must be promoted before
+                    // branching or queuing slow native work.
+                    promoteToForeground()
+                } catch (error: Throwable) {
+                    val message = "foreground promotion failed: ${error.message ?: error}"
+                    desiredRunning.set(false)
+                    lifecycleLog("E", message, error)
+                    updateState("disconnected")
+                    ClashmiVpnRuntime.completeStart(ClashmiVpnRuntime.errorResult(message))
+                    stopSelfResult(startId)
+                    return Service.START_NOT_STICKY
+                }
+                if (!enqueueLifecycle("start") { startCore(startId) }) {
+                    failStart("lifecycle executor rejected start", startId)
+                }
+            }
+            ACTION_STOP -> requestStop("stop action", startId)
+            null -> {
+                // START_NOT_STICKY should prevent null-intent resurrection, but
+                // handle it defensively without unexpectedly rebuilding the VPN.
+                lifecycleLog("W", "null start intent ignored startId=$startId")
+                requestStop("null start intent", startId)
+            }
+            else -> {
+                lifecycleLog("W", "unknown action=${intent.action} startId=$startId")
+                stopSelfResult(startId)
+            }
         }
-        return Service.START_STICKY
+        return Service.START_NOT_STICKY
     }
 
     override fun onDestroy() {
-        stopCore("service destroy")
+        desiredRunning.set(false)
+        ClashmiVpnRuntime.clearPendingStart()
+        if (coreRunning || ClashmiVpnRuntime.currentState != "disconnected") {
+            updateState("disconnecting")
+            enqueueLifecycle("destroy") {
+                stopCore("service destroy", startId = null, stopService = false)
+            }
+        }
+        lifecycleExecutor.shutdown()
         super.onDestroy()
     }
 
     override fun onRevoke() {
-        Log.w(TAG, "vpn revoked")
-        stopCore("vpn revoked")
+        lifecycleLog("W", "vpn permission revoked")
+        requestStop("vpn revoked", startId = null)
         super.onRevoke()
     }
 
-    private fun startCore() {
-        if (worker?.isAlive == true) {
-            Log.i(TAG, "core start ignored: worker already alive")
+    private fun startCore(startId: Int) {
+        if (!desiredRunning.get()) {
+            lifecycleLog("I", "start cancelled before native work startId=$startId")
+            finishCancelledStart(startId)
+            return
+        }
+        if (coreRunning) {
+            lifecycleLog("I", "core start ignored: already connected startId=$startId")
             ClashmiVpnRuntime.completeStart(ClashmiVpnRuntime.doneResult())
             return
         }
-        stopping.set(false)
-        startForegroundService()
-        worker = Thread({
-            val config = ClashmiVpnRuntime.preparedConfig ?: restorePreparedConfig()
-            if (config == null) {
-                failStart("missing prepared config")
-                return@Thread
-            }
-            try {
-                Log.i(TAG, "core starting config=${config.corePath} patch=${config.corePathPatch} finalPatch=${config.corePathPatchFinal}")
-                updateState("connecting")
-                clearErrorFile(config)
-                installSocketProtector()
-                updateAndroidNetworkInfo("core start")
-                registerNetworkCallback()
-                val fd = openTun(config)
-                tunFd = fd
-                Log.i(TAG, "handing tun fd to core fd=$fd")
-                tunFd = -1
-                Clashmicore.start(
-                    config.corePath,
-                    config.corePathPatch,
-                    config.corePathPatchFinal,
-                    config.baseDir,
-                    fd.toLong(),
-                    config.externalController,
-                    config.secret,
-                )
-                Log.i(TAG, "core started fd=$fd controller=${config.externalController} tun=${Clashmicore.tunInfo()}")
-                updateState("connected")
-                ClashmiVpnRuntime.completeStart(ClashmiVpnRuntime.doneResult())
-            } catch (error: Throwable) {
-                val message = error.message ?: error.toString()
-                Log.e(TAG, "core start failed: $message", error)
-                writeErrorFile(config, message)
-                unregisterNetworkCallback()
+        val config = ClashmiVpnRuntime.preparedConfig ?: restorePreparedConfig()
+        if (config == null) {
+            failStart("missing prepared config", startId)
+            return
+        }
+        try {
+            lifecycleLog(
+                "I",
+                "core starting startId=$startId config=${config.corePath} patch=${config.corePathPatch} finalPatch=${config.corePathPatchFinal}",
+            )
+            updateState("connecting")
+            clearErrorFile(config)
+            installSocketProtector()
+            updateAndroidNetworkInfo("core start")
+            registerNetworkCallback()
+            val fd = openTun(config)
+            tunFd = fd
+            if (!desiredRunning.get()) {
+                lifecycleLog("I", "start cancelled before TUN handoff startId=$startId fd=$fd")
                 closeTunFd()
-                Clashmicore.stop()
-                updateState("disconnected")
-                ClashmiVpnRuntime.completeStart(ClashmiVpnRuntime.errorResult(message))
-                stopSelf()
+                finishCancelledStart(startId)
+                return
             }
-        }, "ClashMiVpnCore")
-        worker?.start()
+            lifecycleLog("I", "handing TUN fd to core startId=$startId fd=$fd")
+            // The Go core owns and closes the descriptor after this handoff.
+            tunFd = -1
+            Clashmicore.start(
+                config.corePath,
+                config.corePathPatch,
+                config.corePathPatchFinal,
+                config.baseDir,
+                fd.toLong(),
+                config.externalController,
+                config.secret,
+            )
+            coreRunning = true
+            if (!desiredRunning.get()) {
+                lifecycleLog("I", "start completed after stop request; queued stop will clean up startId=$startId")
+                return
+            }
+            lifecycleLog(
+                "I",
+                "core started startId=$startId controller=${config.externalController} tun=${Clashmicore.tunInfo()}",
+            )
+            updateState("connected")
+            ClashmiVpnRuntime.completeStart(ClashmiVpnRuntime.doneResult())
+        } catch (error: Throwable) {
+            val message = error.message ?: error.toString()
+            desiredRunning.set(false)
+            coreRunning = false
+            lifecycleLog("E", "core start failed startId=$startId: $message", error)
+            writeErrorFile(config, message)
+            unregisterNetworkCallback()
+            closeTunFd()
+            runCatching { Clashmicore.stop() }.onFailure {
+                lifecycleLog("W", "native cleanup after start failure failed: ${it.message}", it)
+            }
+            updateState("disconnected")
+            ClashmiVpnRuntime.completeStart(ClashmiVpnRuntime.errorResult(message))
+            stopForegroundCompat()
+            stopSelfResult(startId)
+        }
     }
 
-    private fun stopCore(reason: String) {
-        if (worker?.isAlive != true &&
-            tunFd < 0 &&
-            tunPfd == null &&
-            ClashmiVpnRuntime.currentState == "disconnected"
-        ) {
-            Log.i(TAG, "core stop ignored: already disconnected reason=$reason")
-            stopSelf()
-            return
+    private fun requestStop(reason: String, startId: Int?) {
+        desiredRunning.set(false)
+        ClashmiVpnRuntime.clearPendingStart()
+        if (ClashmiVpnRuntime.currentState != "disconnected") {
+            updateState("disconnecting")
         }
-        if (!stopping.compareAndSet(false, true)) {
-            return
+        lifecycleLog(
+            "I",
+            "stop requested reason=$reason startId=${startId ?: "none"} coreRunning=$coreRunning",
+        )
+        if (!enqueueLifecycle("stop") { stopCore(reason, startId, stopService = true) }) {
+            ClashmiVpnRuntime.completeStop(
+                ClashmiVpnRuntime.errorResult("lifecycle executor rejected stop", isCloseError = true),
+            )
         }
-        Log.i(TAG, "core stopping reason=$reason")
-        updateState("disconnecting")
+    }
+
+    private fun stopCore(reason: String, startId: Int?, stopService: Boolean) {
+        val startedAt = System.currentTimeMillis()
+        val needsNativeStop = coreRunning ||
+            tunFd >= 0 ||
+            tunPfd != null ||
+            ClashmiVpnRuntime.currentState != "disconnected"
+        lifecycleLog("I", "core stopping reason=$reason nativeCleanup=$needsNativeStop")
         unregisterNetworkCallback()
-        try {
-            Clashmicore.stop()
-        } catch (error: Throwable) {
-            Log.w(TAG, "core stop failed: ${error.message}", error)
+        var stopError: Throwable? = null
+        if (needsNativeStop) {
+            try {
+                // Native shutdown may wait for listeners; never run it on the
+                // Android main thread or acknowledge stop before it returns.
+                Clashmicore.stop()
+            } catch (error: Throwable) {
+                stopError = error
+                lifecycleLog("E", "core stop failed reason=$reason: ${error.message}", error)
+            }
         }
+        coreRunning = false
         closeTunFd()
         updateState("disconnected")
-        stopForegroundCompat()
-        stopSelf()
+        val elapsed = System.currentTimeMillis() - startedAt
+        if (stopError == null) {
+            lifecycleLog("I", "core stopped reason=$reason elapsedMs=$elapsed")
+            ClashmiVpnRuntime.completeStop(ClashmiVpnRuntime.doneResult())
+        } else {
+            ClashmiVpnRuntime.completeStop(
+                ClashmiVpnRuntime.errorResult(
+                    stopError.message ?: stopError.toString(),
+                    isCloseError = true,
+                ),
+            )
+        }
+        if (!desiredRunning.get()) {
+            stopForegroundCompat()
+            if (stopService) {
+                if (startId == null) {
+                    stopSelf()
+                } else {
+                    stopSelfResult(startId)
+                }
+            }
+        }
+    }
+
+    private fun finishCancelledStart(startId: Int) {
+        unregisterNetworkCallback()
+        closeTunFd()
+        updateState("disconnected")
+        if (!desiredRunning.get()) {
+            stopForegroundCompat()
+            stopSelfResult(startId)
+        }
+    }
+
+    private fun enqueueLifecycle(label: String, task: () -> Unit): Boolean {
+        return try {
+            lifecycleExecutor.execute(task)
+            true
+        } catch (error: RejectedExecutionException) {
+            lifecycleLog("E", "lifecycle task rejected label=$label", error)
+            false
+        }
     }
 
     private fun openTun(config: PreparedVpnConfig): Int {
@@ -349,11 +473,13 @@ internal class ClashMiVpnService : VpnService() {
         }
     }
 
-    private fun failStart(message: String) {
-        Log.e(TAG, message)
+    private fun failStart(message: String, startId: Int) {
+        desiredRunning.set(false)
+        lifecycleLog("E", "$message startId=$startId")
         updateState("disconnected")
         ClashmiVpnRuntime.completeStart(ClashmiVpnRuntime.errorResult(message))
-        stopSelf()
+        stopForegroundCompat()
+        stopSelfResult(startId)
     }
 
     private fun updateState(state: String, params: Map<String, String> = emptyMap()) {
@@ -379,7 +505,7 @@ internal class ClashMiVpnService : VpnService() {
         }
     }
 
-    private fun startForegroundService() {
+    private fun promoteToForeground() {
         createNotificationChannel()
         val notification = buildNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -450,6 +576,36 @@ internal class ClashMiVpnService : VpnService() {
             File(errorPath).writeText(message)
         }.onFailure {
             Log.w(TAG, "write error file failed: ${it.message}")
+        }
+    }
+
+    private fun lifecycleLog(level: String, message: String, error: Throwable? = null) {
+        when (level) {
+            "E" -> Log.e(TAG, message, error)
+            "W" -> Log.w(TAG, message, error)
+            else -> Log.i(TAG, message)
+        }
+        val logPath = ClashmiVpnRuntime.preparedConfig?.logPath.orEmpty()
+        if (logPath.isEmpty()) {
+            return
+        }
+        // Logcat is volatile on production devices. Keep lifecycle evidence in
+        // the shared rotating log so intermittent tile/stop races are inspectable.
+        runCatching {
+            val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
+            val stack = error?.let { "\n${Log.getStackTraceString(it)}" }.orEmpty()
+            val rotated = RotatingLogWriter.append(
+                File(logPath),
+                "$timestamp [$level] [${Thread.currentThread().name}] $message$stack\n",
+            )
+            if (rotated) {
+                Log.i(
+                    TAG,
+                    "persistent log rotated path=$logPath maxBytes=${RotatingLogWriter.MAX_FILE_BYTES} maxFiles=${RotatingLogWriter.MAX_FILE_COUNT}",
+                )
+            }
+        }.onFailure {
+            Log.w(TAG, "append lifecycle log failed path=$logPath: ${it.message}")
         }
     }
 
