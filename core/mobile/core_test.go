@@ -3,11 +3,14 @@ package clashmicore
 import (
 	"context"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/component/dialer"
@@ -15,8 +18,116 @@ import (
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
 	mihomoDNS "github.com/metacubex/mihomo/dns"
+	"github.com/metacubex/mihomo/log"
+	"github.com/metacubex/tailscale/net/netmon"
 	"gopkg.in/yaml.v3"
 )
+
+func TestSetAndroidNetworkInfoUpdatesTailscaleDefaultRoute(t *testing.T) {
+	previous, previousErr := netmon.DefaultRouteInterface()
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var target string
+	for _, iface := range interfaces {
+		addrs, addrErr := iface.Addrs()
+		if iface.Name != previous && iface.Flags&net.FlagUp != 0 && iface.Flags&net.FlagLoopback == 0 && addrErr == nil && len(addrs) > 0 {
+			target = iface.Name
+			break
+		}
+	}
+	if target == "" {
+		t.Skip("no alternate active interface available")
+	}
+	if previousErr == nil {
+		t.Cleanup(func() {
+			netmon.UpdateLastKnownDefaultRouteInterface(previous)
+		})
+	}
+
+	raw := `{"defaultInterface":"` + target + `","interfaces":[]}`
+	if err := SetAndroidNetworkInfo(raw); err != nil {
+		t.Fatal(err)
+	}
+	got, err := netmon.DefaultRouteInterface()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != target {
+		t.Fatalf("default route interface = %q, want %q after Android network update", got, target)
+	}
+}
+
+func TestSetAndroidNetworkInfoRejectsMalformedSnapshot(t *testing.T) {
+	if err := SetAndroidNetworkInfo("{"); err == nil {
+		t.Fatal("SetAndroidNetworkInfo malformed snapshot error = nil, want parse failure")
+	}
+}
+
+func TestAndroidSocketProtectorHooksMihomoTailscaleFork(t *testing.T) {
+	source, err := os.ReadFile("socket_protector_android.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	for _, importPath := range []string{
+		`"github.com/metacubex/tailscale/net/netns"`,
+		`"github.com/metacubex/tailscale/net/tshttpproxy"`,
+	} {
+		if !strings.Contains(text, importPath) {
+			t.Errorf("Android socket protector is missing runtime Tailscale import %s", importPath)
+		}
+	}
+	if strings.Contains(text, `"tailscale.com/net/`) {
+		t.Error("Android socket protector configures tailscale.com globals instead of Mihomo's github.com/metacubex/tailscale runtime")
+	}
+}
+
+type recordingPersistentLogWriter struct {
+	lines chan string
+}
+
+func (w *recordingPersistentLogWriter) Write(level string, message string) {
+	w.lines <- level + " " + message
+}
+
+func TestPersistentCoreLogWriterKeepsNetworkDiagnosticsAndDropsConnectionNoise(t *testing.T) {
+	writer := &recordingPersistentLogWriter{lines: make(chan string, 4)}
+	SetPersistentLogWriter(writer)
+	t.Cleanup(ClearPersistentLogWriter)
+
+	log.Debugln("[TCP] noisy per-connection diagnostic that must stay in the live log")
+	log.Debugln("[Tailscale](test) wg: Handshake did not complete after 5 seconds")
+
+	select {
+	case line := <-writer.lines:
+		if !strings.Contains(line, "Handshake did not complete") {
+			t.Fatalf("persistent line = %q, want selected Tailscale network diagnostic", line)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for persistent Tailscale network diagnostic")
+	}
+
+	select {
+	case line := <-writer.lines:
+		t.Fatalf("unexpected additional persistent line: %q", line)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestSanitizePersistentCoreLogRedactsSecretsAndFlattensLines(t *testing.T) {
+	got := sanitizePersistentCoreLog("network changed\nauth-key=secret-value token=token-value")
+	if strings.Contains(got, "secret-value") || strings.Contains(got, "token-value") {
+		t.Fatalf("sanitized persistent log leaked credentials: %q", got)
+	}
+	if strings.ContainsAny(got, "\r\n") {
+		t.Fatalf("sanitized persistent log contains a line break: %q", got)
+	}
+	if !strings.Contains(got, "auth-key=[REDACTED]") || !strings.Contains(got, "token=[REDACTED]") {
+		t.Fatalf("sanitized persistent log = %q, want explicit redaction markers", got)
+	}
+}
 
 func TestBuildRuntimeConfigDefaultsToSystemTunStack(t *testing.T) {
 	configFile := writeTempFile(t, "config.yaml", "mixed-port: 7890\nipv6: true\n")

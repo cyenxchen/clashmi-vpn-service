@@ -4,7 +4,7 @@ package clashmicore
 
 func setTailscaleSocketProtector(SocketProtector) {}
 
-func setTailscaleAndroidDNSServersFromRaw(string) bool { return false }
+func setTailscaleAndroidDNSServers(androidNetworkInfo) bool { return false }
 
 func setTailscaleControlHTTPProxy(string) {}
 

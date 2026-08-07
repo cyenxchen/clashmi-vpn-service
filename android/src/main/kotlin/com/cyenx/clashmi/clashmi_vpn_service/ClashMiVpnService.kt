@@ -17,6 +17,7 @@ import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import com.cyenx.clashmi.core.clashmicore.Clashmicore
+import com.cyenx.clashmi.core.clashmicore.PersistentLogWriter
 import com.cyenx.clashmi.core.clashmicore.SocketProtector
 import java.io.File
 import java.net.NetworkInterface
@@ -39,6 +40,7 @@ internal class ClashMiVpnService : VpnService() {
     private var tunFd: Int = -1
     private var tunPfd: ParcelFileDescriptor? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private val networkSnapshotLogTracker = NetworkSnapshotLogTracker()
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -119,6 +121,7 @@ internal class ClashMiVpnService : VpnService() {
             )
             updateState("connecting")
             clearErrorFile(config)
+            installPersistentCoreLogWriter()
             installSocketProtector()
             updateAndroidNetworkInfo("core start")
             registerNetworkCallback()
@@ -164,6 +167,7 @@ internal class ClashMiVpnService : VpnService() {
             runCatching { Clashmicore.stop() }.onFailure {
                 lifecycleLog("W", "native cleanup after start failure failed: ${it.message}", it)
             }
+            clearPersistentCoreLogWriter()
             updateState("disconnected")
             ClashmiVpnRuntime.completeStart(ClashmiVpnRuntime.errorResult(message))
             stopForegroundCompat()
@@ -207,6 +211,7 @@ internal class ClashMiVpnService : VpnService() {
                 lifecycleLog("E", "core stop failed reason=$reason: ${error.message}", error)
             }
         }
+        clearPersistentCoreLogWriter()
         coreRunning = false
         closeTunFd()
         updateState("disconnected")
@@ -320,6 +325,30 @@ internal class ClashMiVpnService : VpnService() {
         Log.i(TAG, "socket protector installed")
     }
 
+    private fun installPersistentCoreLogWriter() {
+        Clashmicore.setPersistentLogWriter(
+            object : PersistentLogWriter {
+                override fun write(level: String, message: String) {
+                    // Mihomo keeps its own observable logging system. Persist only
+                    // the filtered diagnostic events selected by the Go bridge.
+                    val normalizedLevel = level.uppercase(Locale.US).takeIf {
+                        it in setOf("DEBUG", "INFO", "WARNING", "ERROR")
+                    } ?: "UNKNOWN"
+                    appendPersistentLog("CORE-$normalizedLevel", message)
+                }
+            },
+        )
+        lifecycleLog("I", "persistent core network diagnostics enabled")
+    }
+
+    private fun clearPersistentCoreLogWriter() {
+        runCatching {
+            Clashmicore.clearPersistentLogWriter()
+        }.onFailure {
+            Log.w(TAG, "clear persistent core log writer failed: ${it.message}", it)
+        }
+    }
+
     private fun protectCoreSocket(fd: Long): Boolean {
         if (fd < 0 || fd > Int.MAX_VALUE) {
             Log.w(TAG, "socket protect rejected invalid fd=$fd")
@@ -367,6 +396,7 @@ internal class ClashMiVpnService : VpnService() {
     }
 
     private fun unregisterNetworkCallback() {
+        networkSnapshotLogTracker.reset()
         val callback = networkCallback ?: return
         networkCallback = null
         try {
@@ -377,16 +407,26 @@ internal class ClashMiVpnService : VpnService() {
         }
     }
 
+    @Synchronized
     private fun updateAndroidNetworkInfo(reason: String) {
         try {
             val snapshot = buildAndroidNetworkSnapshot(reason) ?: return
-            Clashmicore.setAndroidNetworkInfo(snapshot.json.toString())
-            Log.i(
-                TAG,
-                "android network info sent reason=$reason default=${snapshot.defaultInterface} interfaces=${snapshot.interfaceCount}",
-            )
+            val raw = snapshot.json.toString()
+            val changed = networkSnapshotLogTracker.changed(raw)
+            Clashmicore.setAndroidNetworkInfo(raw)
+            val message =
+                "android network info sent reason=$reason default=${snapshot.defaultInterface.ifEmpty { "none" }} " +
+                    "interfaces=${snapshot.interfaceCount} changed=$changed"
+            if (changed) {
+                // Persist transitions, not repeated capability callbacks with the
+                // same snapshot, so the overnight timeline remains readable.
+                lifecycleLog("I", message)
+            } else {
+                Log.i(TAG, message)
+            }
         } catch (error: Throwable) {
-            Log.w(TAG, "send android network info failed reason=$reason error=${error.message}", error)
+            networkSnapshotLogTracker.reset()
+            lifecycleLog("W", "send android network info failed reason=$reason error=${error.message}", error)
         }
     }
 
@@ -585,6 +625,11 @@ internal class ClashMiVpnService : VpnService() {
             "W" -> Log.w(TAG, message, error)
             else -> Log.i(TAG, message)
         }
+        val stack = error?.let { "\n${Log.getStackTraceString(it)}" }.orEmpty()
+        appendPersistentLog(level, "$message$stack")
+    }
+
+    private fun appendPersistentLog(level: String, message: String) {
         val logPath = ClashmiVpnRuntime.preparedConfig?.logPath.orEmpty()
         if (logPath.isEmpty()) {
             return
@@ -593,10 +638,9 @@ internal class ClashMiVpnService : VpnService() {
         // the shared rotating log so intermittent tile/stop races are inspectable.
         runCatching {
             val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
-            val stack = error?.let { "\n${Log.getStackTraceString(it)}" }.orEmpty()
             val rotated = RotatingLogWriter.append(
                 File(logPath),
-                "$timestamp [$level] [${Thread.currentThread().name}] $message$stack\n",
+                "$timestamp [$level] [${Thread.currentThread().name}] $message\n",
             )
             if (rotated) {
                 Log.i(
@@ -605,7 +649,7 @@ internal class ClashMiVpnService : VpnService() {
                 )
             }
         }.onFailure {
-            Log.w(TAG, "append lifecycle log failed path=$logPath: ${it.message}")
+            Log.w(TAG, "append persistent log failed path=$logPath: ${it.message}")
         }
     }
 

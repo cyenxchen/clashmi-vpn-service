@@ -3,7 +3,6 @@
 package clashmicore
 
 import (
-	"encoding/json"
 	"net"
 	"net/netip"
 	"net/url"
@@ -13,8 +12,8 @@ import (
 	"sync/atomic"
 
 	"github.com/metacubex/mihomo/log"
-	"tailscale.com/net/netns"
-	"tailscale.com/net/tshttpproxy"
+	"github.com/metacubex/tailscale/net/netns"
+	"github.com/metacubex/tailscale/net/tshttpproxy"
 )
 
 var (
@@ -31,12 +30,6 @@ var (
 	tailscaleProxySelectCount atomic.Uint64
 )
 
-type androidNetworkDNSInfo struct {
-	Interfaces []struct {
-		DNSServers []string `json:"dnsServers"`
-	} `json:"interfaces"`
-}
-
 func setTailscaleSocketProtector(protector SocketProtector) {
 	tailscaleProxyMu.Lock()
 	tailscaleSocketProtector = protector
@@ -44,13 +37,7 @@ func setTailscaleSocketProtector(protector SocketProtector) {
 	tailscaleProxyMu.Unlock()
 }
 
-func setTailscaleAndroidDNSServersFromRaw(raw string) bool {
-	var info androidNetworkDNSInfo
-	if err := json.Unmarshal([]byte(raw), &info); err != nil {
-		log.Warnln("[ClashMiCore] parse Android physical DNS servers failed: %v", err)
-		return false
-	}
-
+func setTailscaleAndroidDNSServers(info androidNetworkInfo) bool {
 	seen := map[string]struct{}{}
 	servers := make([]string, 0)
 	for _, iface := range info.Interfaces {
