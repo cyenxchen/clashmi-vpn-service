@@ -54,28 +54,54 @@ func (w *recordingPersistentLogWriter) Write(level string, message string) {
 	w.lines <- level + " " + message
 }
 
+func waitForPersistentLog(t *testing.T, lines <-chan string, want string, forbidden string, timeout time.Duration) {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case line := <-lines:
+			if strings.Contains(line, forbidden) {
+				t.Fatalf("unexpected persistent connection noise: %q", line)
+			}
+			if strings.Contains(line, want) {
+				return
+			}
+			// Mihomo fans logs out asynchronously, so diagnostics emitted by a
+			// preceding test can arrive after this test installs its writer.
+		case <-timer.C:
+			t.Fatalf("timed out waiting for persistent log containing %q", want)
+		}
+	}
+}
+
+func assertNoPersistentLogContaining(t *testing.T, lines <-chan string, forbidden string, duration time.Duration) {
+	t.Helper()
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	for {
+		select {
+		case line := <-lines:
+			if strings.Contains(line, forbidden) {
+				t.Fatalf("unexpected persistent connection noise: %q", line)
+			}
+		case <-timer.C:
+			return
+		}
+	}
+}
+
 func TestPersistentCoreLogWriterKeepsNetworkDiagnosticsAndDropsConnectionNoise(t *testing.T) {
 	writer := &recordingPersistentLogWriter{lines: make(chan string, 4)}
 	SetPersistentLogWriter(writer)
 	t.Cleanup(ClearPersistentLogWriter)
 
-	log.Debugln("[TCP] noisy per-connection diagnostic that must stay in the live log")
+	const connectionNoise = "noisy per-connection diagnostic that must stay in the live log"
+	log.Debugln("[TCP] " + connectionNoise)
 	log.Debugln("[Tailscale](test) wg: Handshake did not complete after 5 seconds")
 
-	select {
-	case line := <-writer.lines:
-		if !strings.Contains(line, "Handshake did not complete") {
-			t.Fatalf("persistent line = %q, want selected Tailscale network diagnostic", line)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for persistent Tailscale network diagnostic")
-	}
-
-	select {
-	case line := <-writer.lines:
-		t.Fatalf("unexpected additional persistent line: %q", line)
-	case <-time.After(100 * time.Millisecond):
-	}
+	waitForPersistentLog(t, writer.lines, "Handshake did not complete", connectionNoise, 2*time.Second)
+	assertNoPersistentLogContaining(t, writer.lines, connectionNoise, 100*time.Millisecond)
 }
 
 func TestShouldPersistCoreLogKeepsTailscaleNodeNotFound(t *testing.T) {
