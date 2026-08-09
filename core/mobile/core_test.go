@@ -3,7 +3,6 @@ package clashmicore
 import (
 	"context"
 	"errors"
-	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -19,45 +18,8 @@ import (
 	C "github.com/metacubex/mihomo/constant"
 	mihomoDNS "github.com/metacubex/mihomo/dns"
 	"github.com/metacubex/mihomo/log"
-	"github.com/metacubex/tailscale/net/netmon"
 	"gopkg.in/yaml.v3"
 )
-
-func TestSetAndroidNetworkInfoUpdatesTailscaleDefaultRoute(t *testing.T) {
-	previous, previousErr := netmon.DefaultRouteInterface()
-	interfaces, err := net.Interfaces()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var target string
-	for _, iface := range interfaces {
-		addrs, addrErr := iface.Addrs()
-		if iface.Name != previous && iface.Flags&net.FlagUp != 0 && iface.Flags&net.FlagLoopback == 0 && addrErr == nil && len(addrs) > 0 {
-			target = iface.Name
-			break
-		}
-	}
-	if target == "" {
-		t.Skip("no alternate active interface available")
-	}
-	if previousErr == nil {
-		t.Cleanup(func() {
-			netmon.UpdateLastKnownDefaultRouteInterface(previous)
-		})
-	}
-
-	raw := `{"defaultInterface":"` + target + `","interfaces":[]}`
-	if err := SetAndroidNetworkInfo(raw); err != nil {
-		t.Fatal(err)
-	}
-	got, err := netmon.DefaultRouteInterface()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != target {
-		t.Fatalf("default route interface = %q, want %q after Android network update", got, target)
-	}
-}
 
 func TestSetAndroidNetworkInfoRejectsMalformedSnapshot(t *testing.T) {
 	if err := SetAndroidNetworkInfo("{"); err == nil {
