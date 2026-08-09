@@ -66,6 +66,11 @@ func shouldPersistCoreLog(event log.Event) bool {
 	if event.LogLevel >= log.WARNING {
 		return true
 	}
+	// A deleted Headscale identity otherwise retries forever at debug level and
+	// leaves no historical evidence after the live controller stream is gone.
+	if strings.Contains(payload, "PollNetMap") && strings.Contains(payload, "node not found") {
+		return true
+	}
 	for _, marker := range []string{
 		"network change",
 		"monitor:",

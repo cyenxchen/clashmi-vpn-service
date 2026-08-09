@@ -116,6 +116,16 @@ func TestPersistentCoreLogWriterKeepsNetworkDiagnosticsAndDropsConnectionNoise(t
 	}
 }
 
+func TestShouldPersistCoreLogKeepsTailscaleNodeNotFound(t *testing.T) {
+	event := log.Event{
+		LogLevel: log.DEBUG,
+		Payload:  "[Tailscale](test) control: PollNetMap: initial fetch failed 404: node not found",
+	}
+	if !shouldPersistCoreLog(event) {
+		t.Fatal("Tailscale node-not-found control failure was dropped from persistent diagnostics")
+	}
+}
+
 func TestSanitizePersistentCoreLogRedactsSecretsAndFlattensLines(t *testing.T) {
 	got := sanitizePersistentCoreLog("network changed\nauth-key=secret-value token=token-value")
 	if strings.Contains(got, "secret-value") || strings.Contains(got, "token-value") {
