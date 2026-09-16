@@ -33,13 +33,18 @@ func TestAndroidSocketProtectorHooksMihomoTailscaleFork(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(source)
-	for _, importPath := range []string{
+	for _, required := range []string{
+		`http "github.com/metacubex/http"`,
+		`"github.com/metacubex/tailscale/feature"`,
 		`"github.com/metacubex/tailscale/net/netns"`,
-		`"github.com/metacubex/tailscale/net/tshttpproxy"`,
+		`feature.HookProxyFromEnvironment.Set(tailscaleProxyFromRequest)`,
 	} {
-		if !strings.Contains(text, importPath) {
-			t.Errorf("Android socket protector is missing runtime Tailscale import %s", importPath)
+		if !strings.Contains(text, required) {
+			t.Errorf("Android socket protector is missing required Tailscale hook code %s", required)
 		}
+	}
+	if strings.Contains(text, `"github.com/metacubex/tailscale/net/tshttpproxy"`) {
+		t.Error("Android socket protector imports the removed Tailscale tshttpproxy package")
 	}
 	if strings.Contains(text, `"tailscale.com/net/`) {
 		t.Error("Android socket protector configures tailscale.com globals instead of Mihomo's github.com/metacubex/tailscale runtime")

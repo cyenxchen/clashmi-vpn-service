@@ -3,6 +3,7 @@
 package clashmicore
 
 import (
+	"errors"
 	"net"
 	"net/netip"
 	"net/url"
@@ -11,9 +12,10 @@ import (
 	"sync"
 	"sync/atomic"
 
+	http "github.com/metacubex/http"
 	"github.com/metacubex/mihomo/log"
+	"github.com/metacubex/tailscale/feature"
 	"github.com/metacubex/tailscale/net/netns"
-	"github.com/metacubex/tailscale/net/tshttpproxy"
 )
 
 var (
@@ -72,13 +74,17 @@ func setTailscaleControlHTTPProxy(proxyURL string) {
 
 	// The proxy hook must be installed before enabling the Android netns protector.
 	//
-	// Tailscale's control client asks tshttpproxy for an HTTP proxy before it
-	// dials controlplane.tailscale.com. If the hook is missing while netns
+	// Tailscale's control client asks HookProxyFromEnvironment for an HTTP proxy
+	// before it dials controlplane.tailscale.com. If the hook is missing while netns
 	// protection is enabled, Android's VpnService.protect would let the
 	// controlplane socket escape the VPN and bypass Mihomo rules. That is the
 	// old registration regression this guard is meant to prevent.
 	tailscaleProxyInstallOnce.Do(func() {
-		tailscaleProxyInstallErr = tshttpproxy.SetProxyFunc(tailscaleProxyFromConfig)
+		if feature.HookProxyFromEnvironment.IsSet() {
+			tailscaleProxyInstallErr = errors.New("Tailscale control proxy hook is already installed")
+			return
+		}
+		feature.HookProxyFromEnvironment.Set(tailscaleProxyFromRequest)
 	})
 	if tailscaleProxyInstallErr != nil {
 		log.Warnln("[ClashMiCore] install Tailscale control proxy hook failed: %v", tailscaleProxyInstallErr)
@@ -153,6 +159,13 @@ func applyTailscaleNetnsProtectorLocked() {
 	}
 	tailscaleNetnsProtected = true
 	tailscaleNetnsProxyURL = proxyURL
+}
+
+func tailscaleProxyFromRequest(request *http.Request) (*url.URL, error) {
+	if request == nil || request.URL == nil {
+		return nil, nil
+	}
+	return tailscaleProxyFromConfig(request.URL)
 }
 
 func tailscaleProxyFromConfig(target *url.URL) (*url.URL, error) {
