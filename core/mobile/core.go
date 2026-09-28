@@ -77,6 +77,7 @@ func SetAndroidNetworkInfo(raw string) error {
 		log.Warnln("[ClashMiCore] parse Android network snapshot failed: %v", err)
 		return err
 	}
+	defer androidNetworkHealth.update(info)
 	dnsChanged := setTailscaleAndroidDNSServers(info)
 	registered, notified := outbound.NotifyTailscaleNetworkChange(info.DefaultInterface)
 	if dnsChanged {
@@ -179,6 +180,7 @@ func Start(configFile string, patchFile string, finalPatchFile string, homeDir s
 	running = true
 	lastHome = homeDir
 	mergeStartupRuntimeConfigState(cfg.DNS, cfg.General.IPv6, runtimeConfig.injectedDNSPolicyHosts)
+	androidNetworkHealth.start()
 	log.Infoln("[ClashMiCore] started stack=%s fd=%d address=%v", tunConf.Stack.String(), tunConf.FileDescriptor, tunConf.Inet4Address)
 	return nil
 }
@@ -238,6 +240,7 @@ func HomeDir() string {
 }
 
 func shutdownLocked() {
+	androidNetworkHealth.stop()
 	if !running {
 		return
 	}
@@ -326,6 +329,9 @@ func mergeDNSPolicyHosts(existing []string, incoming []string) []string {
 }
 
 func syncRuntimeConfigStateFromAppliedConfig(cfg *config.Config) {
+	if cfg != nil {
+		androidNetworkHealth.setProviders(cfg.Providers)
+	}
 	syncRuntimeConfigStateFromAppliedConfigWithServers(cfg, androidPhysicalDNSServers())
 }
 

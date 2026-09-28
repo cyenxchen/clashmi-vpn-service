@@ -458,6 +458,8 @@ internal class ClashMiVpnService : VpnService() {
                 .put("name", interfaceName)
                 .put("index", interfaceIndex(interfaceName))
                 .put("mtu", linkProperties.mtu)
+                .put("networkHandle", network.networkHandle)
+                .put("validated", capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED))
                 .put("addresses", addresses)
                 .put("dnsServers", dnsServers)
             AndroidNetworkCandidate(
