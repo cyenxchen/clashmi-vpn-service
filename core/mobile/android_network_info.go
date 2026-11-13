@@ -14,6 +14,11 @@ type androidNetworkInfo struct {
 }
 
 type androidNetworkInterface struct {
+	Transport     string   `json:"transport,omitempty"`
+	SSID          string   `json:"ssid,omitempty"`
+	BSSID         string   `json:"bssid,omitempty"`
+	Gateway       string   `json:"gateway,omitempty"`
+	DHCPServer    string   `json:"dhcpServer,omitempty"`
 	Name          string   `json:"name"`
 	Index         int      `json:"index"`
 	MTU           int      `json:"mtu"`
@@ -32,6 +37,7 @@ func (info androidNetworkInfo) healthCheckFingerprint() (string, bool) {
 		if info.DefaultInterface != "" && iface.Name == info.DefaultInterface && len(iface.Addresses) > 0 {
 			available = true
 		}
+		iface.Transport, iface.SSID, iface.BSSID, iface.Gateway, iface.DHCPServer = "", "", "", "", ""
 		encoded, _ := json.Marshal(iface)
 		interfaces = append(interfaces, string(encoded))
 	}

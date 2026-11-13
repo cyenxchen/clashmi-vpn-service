@@ -1,11 +1,16 @@
 package com.cyenx.clashmi.clashmi_vpn_service
 
 import android.app.Notification
+import androidx.core.content.ContextCompat
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
+import android.location.LocationManager
+import android.content.Context
+import android.content.BroadcastReceiver
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.LinkProperties
@@ -13,7 +18,11 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.VpnService
+import android.net.wifi.WifiInfo
+import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import com.cyenx.clashmi.core.clashmicore.Clashmicore
@@ -21,10 +30,14 @@ import com.cyenx.clashmi.core.clashmicore.PersistentLogWriter
 import com.cyenx.clashmi.core.clashmicore.SocketProtector
 import java.io.File
 import java.net.NetworkInterface
+import java.net.InetAddress
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
 import org.json.JSONArray
@@ -40,6 +53,25 @@ internal class ClashMiVpnService : VpnService() {
     private var tunFd: Int = -1
     private var tunPfd: ParcelFileDescriptor? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private val underlyingNetwork = ForkUnderlyingNetwork<Network>(
+        schedule = { delay, action ->
+            val handler = Handler(requireNotNull(networkThread).looper)
+            val task = Runnable { action() }
+            handler.postDelayed(task, delay)
+            ({ handler.removeCallbacks(task) })
+        },
+        onExpired = {
+            initialNetwork.countDown()
+            updateAndroidNetworkInfo("underlying network loss confirmed")
+        },
+    )
+    private val networkEpoch = ForkNetworkEpoch()
+    private val networkCapabilities = ConcurrentHashMap<Network, NetworkCapabilities>()
+    private val networkLinks = ConcurrentHashMap<Network, LinkProperties>()
+    private var networkThread: HandlerThread? = null
+    private var initialNetwork = CountDownLatch(1)
+    @Volatile private var underlyingKnown = false
+    private var locationReceiver: BroadcastReceiver? = null
     private val networkSnapshotLogTracker = NetworkSnapshotLogTracker()
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -123,28 +155,30 @@ internal class ClashMiVpnService : VpnService() {
             clearErrorFile(config)
             installPersistentCoreLogWriter()
             installSocketProtector()
-            updateAndroidNetworkInfo("core start")
             registerNetworkCallback()
-            val fd = openTun(config)
-            tunFd = fd
-            if (!desiredRunning.get()) {
-                lifecycleLog("I", "start cancelled before TUN handoff startId=$startId fd=$fd")
-                closeTunFd()
-                finishCancelledStart(startId)
-                return
+            initialNetwork.await(2, TimeUnit.SECONDS)
+            forkReportBeforeStart({ updateAndroidNetworkInfo("core start") }) {
+                val fd = openTun(config)
+                tunFd = fd
+                if (!desiredRunning.get()) {
+                    lifecycleLog("I", "start cancelled before TUN handoff startId=$startId fd=$fd")
+                    closeTunFd()
+                    finishCancelledStart(startId)
+                    return
+                }
+                lifecycleLog("I", "handing TUN fd to core startId=$startId fd=$fd")
+                // The Go core owns and closes the descriptor after this handoff.
+                tunFd = -1
+                Clashmicore.start(
+                    config.corePath,
+                    config.corePathPatch,
+                    config.corePathPatchFinal,
+                    config.baseDir,
+                    fd.toLong(),
+                    config.externalController,
+                    config.secret,
+                )
             }
-            lifecycleLog("I", "handing TUN fd to core startId=$startId fd=$fd")
-            // The Go core owns and closes the descriptor after this handoff.
-            tunFd = -1
-            Clashmicore.start(
-                config.corePath,
-                config.corePathPatch,
-                config.corePathPatchFinal,
-                config.baseDir,
-                fd.toLong(),
-                config.externalController,
-                config.secret,
-            )
             coreRunning = true
             if (!desiredRunning.get()) {
                 lifecycleLog("I", "start completed after stop request; queued stop will clean up startId=$startId")
@@ -362,55 +396,134 @@ internal class ClashMiVpnService : VpnService() {
     }
 
     private fun registerNetworkCallback() {
-        if (networkCallback != null) {
-            return
-        }
+        if (networkCallback != null) return
         val connectivityManager = getSystemService(ConnectivityManager::class.java)
-        val callback = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                updateAndroidNetworkInfo("network available")
+        initialNetwork = CountDownLatch(1)
+        underlyingKnown = false
+        val thread = HandlerThread("ClashMiUnderlyingNetwork").also { it.start() }
+        networkThread = thread
+        val epoch = networkEpoch.begin()
+        val flags = if (Build.VERSION.SDK_INT >= 31) ConnectivityManager.NetworkCallback.FLAG_INCLUDE_LOCATION_INFO else 0
+        val callback = if (Build.VERSION.SDK_INT >= 31) {
+            object : ConnectivityManager.NetworkCallback(flags) {
+                override fun onAvailable(network: Network) = networkEpoch.accept(epoch) { onUnderlyingAvailable(network) }
+                override fun onLost(network: Network) = networkEpoch.accept(epoch) { onUnderlyingLost(network) }
+                override fun onLinkPropertiesChanged(network: Network, properties: LinkProperties) = networkEpoch.accept(epoch) { onUnderlyingLinks(network, properties) }
+                override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) = networkEpoch.accept(epoch) { onUnderlyingCapabilities(network, capabilities) }
             }
-
-            override fun onLost(network: Network) {
-                updateAndroidNetworkInfo("network lost")
-            }
-
-            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
-                updateAndroidNetworkInfo("link properties changed")
-            }
-
-            override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
-                updateAndroidNetworkInfo("network capabilities changed")
+        } else {
+            object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) = networkEpoch.accept(epoch) { onUnderlyingAvailable(network) }
+                override fun onLost(network: Network) = networkEpoch.accept(epoch) { onUnderlyingLost(network) }
+                override fun onLinkPropertiesChanged(network: Network, properties: LinkProperties) = networkEpoch.accept(epoch) { onUnderlyingLinks(network, properties) }
+                override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) = networkEpoch.accept(epoch) { onUnderlyingCapabilities(network, capabilities) }
             }
         }
         val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             .build()
         try {
-            connectivityManager.registerNetworkCallback(request, callback)
+            val handler = Handler(thread.looper)
+            if (Build.VERSION.SDK_INT >= 31) connectivityManager.registerBestMatchingNetworkCallback(request, callback, handler)
+            else connectivityManager.requestNetwork(request, callback, handler)
             networkCallback = callback
-            Log.i(TAG, "network callback registered")
+            installNetworkPermissionObservers()
+            Log.i(TAG, "underlying best-network callback registered")
         } catch (error: Throwable) {
+            thread.quitSafely()
+            networkThread = null
+            initialNetwork.countDown()
+            networkEpoch.begin()
             Log.w(TAG, "register network callback failed: ${error.message}", error)
         }
     }
 
-    private fun unregisterNetworkCallback() {
-        networkSnapshotLogTracker.reset()
-        val callback = networkCallback ?: return
-        networkCallback = null
-        try {
-            getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(callback)
-            Log.i(TAG, "network callback unregistered")
-        } catch (error: Throwable) {
-            Log.w(TAG, "unregister network callback ignored: ${error.message}")
+    private fun onUnderlyingAvailable(network: Network) {
+        underlyingKnown = true
+        forkUnderlyingAvailable(underlyingNetwork, network, networkCapabilities, networkLinks)
+    }
+
+    private fun onUnderlyingLost(network: Network) {
+        underlyingKnown = true
+        underlyingNetwork.lost(network)
+        networkCapabilities.remove(network)
+        networkLinks.remove(network)
+
+    }
+
+    private fun onUnderlyingLinks(network: Network, properties: LinkProperties) {
+        if (network != underlyingNetwork.current()) return
+        networkLinks[network] = properties
+        updateAndroidNetworkInfo("underlying link properties changed")
+    }
+
+    private fun onUnderlyingCapabilities(network: Network, capabilities: NetworkCapabilities) {
+        if (network != underlyingNetwork.current()) return
+        networkCapabilities[network] = capabilities
+        updateAndroidNetworkInfo("underlying capabilities changed")
+    }
+
+    private fun refreshNetworkPermission() {
+        enqueueLifecycle("location permission changed") {
+            forkRefreshRegistration(desiredRunning.get(), ::unregisterNetworkCallback, ::registerNetworkCallback)
         }
+    }
+
+    private fun networkPermissionSignature(): String {
+        val location = getSystemService(LocationManager::class.java)
+        return forkNetworkPermissionSignature(listOf(
+            android.Manifest.permission.ACCESS_FINE_LOCATION,
+            android.Manifest.permission.ACCESS_COARSE_LOCATION,
+            android.Manifest.permission.ACCESS_BACKGROUND_LOCATION,
+        ).map { checkSelfPermission(it) },
+            location.isProviderEnabled(LocationManager.GPS_PROVIDER),
+            location.isProviderEnabled(LocationManager.NETWORK_PROVIDER))
+    }
+
+    private fun installNetworkPermissionObservers() {
+        val handler = networkThread?.looper?.let { Handler(it) }
+        var previous = networkPermissionSignature()
+        if (handler != null) handler.postDelayed(object : Runnable {
+            override fun run() {
+                val current = networkPermissionSignature()
+                if (current != previous) {
+                    previous = current
+                    refreshNetworkPermission()
+                } else if (networkCallback != null) handler.postDelayed(this, 10000)
+            }
+        }, 10000)
+        if (locationReceiver == null) {
+            locationReceiver = object : BroadcastReceiver() {
+                override fun onReceive(context: Context, intent: Intent) = refreshNetworkPermission()
+            }.also {
+                val filter = IntentFilter("${packageName}.NETWORK_LOCATION_CHANGED")
+                ContextCompat.registerReceiver(this, it, filter, forkLocationReceiverFlags(Build.VERSION.SDK_INT))
+            }
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        networkEpoch.begin() // Ignore already queued callbacks from the old registration.
+        networkSnapshotLogTracker.reset()
+        locationReceiver?.let { runCatching { unregisterReceiver(it) } }
+        locationReceiver = null
+        networkCallback?.let { callback ->
+            runCatching { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(callback) }
+        }
+        networkCallback = null
+        networkThread?.quitSafely()
+        networkThread = null
+        underlyingNetwork.clear()
+        networkCapabilities.clear()
+        networkLinks.clear()
     }
 
     @Synchronized
     private fun updateAndroidNetworkInfo(reason: String) {
         try {
             val snapshot = buildAndroidNetworkSnapshot(reason) ?: return
+            initialNetwork.countDown()
             val raw = snapshot.json.toString()
             val changed = networkSnapshotLogTracker.changed(raw)
             Clashmicore.setAndroidNetworkInfo(raw)
@@ -420,7 +533,7 @@ internal class ClashMiVpnService : VpnService() {
             if (changed) {
                 // Persist transitions, not repeated capability callbacks with the
                 // same snapshot, so the overnight timeline remains readable.
-                lifecycleLog("I", message)
+                lifecycleLog("I", "$message snapshot=$raw")
             } else {
                 Log.i(TAG, message)
             }
@@ -432,10 +545,11 @@ internal class ClashMiVpnService : VpnService() {
 
     private fun buildAndroidNetworkSnapshot(reason: String): AndroidNetworkSnapshot? {
         val connectivityManager = getSystemService(ConnectivityManager::class.java)
-        val activeNetwork = connectivityManager.activeNetwork
+        val physicalDefault = underlyingNetwork.current()
+        if (physicalDefault != null && !forkNetworkReady(physicalDefault, networkCapabilities, networkLinks)) return null
         val candidates = connectivityManager.allNetworks.mapNotNull { network ->
-            val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return@mapNotNull null
-            val linkProperties = connectivityManager.getLinkProperties(network) ?: return@mapNotNull null
+            val capabilities = networkCapabilities[network] ?: connectivityManager.getNetworkCapabilities(network) ?: return@mapNotNull null
+            val linkProperties = networkLinks[network] ?: connectivityManager.getLinkProperties(network) ?: return@mapNotNull null
             val interfaceName = linkProperties.interfaceName?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
             if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
                 return@mapNotNull null
@@ -462,24 +576,46 @@ internal class ClashMiVpnService : VpnService() {
                 .put("validated", capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED))
                 .put("addresses", addresses)
                 .put("dnsServers", dnsServers)
+            val transport = forkNetworkTransport(
+                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI),
+                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET),
+                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR),
+            )
+            if (transport.isNotEmpty()) payload.put("transport", transport)
+            val gateway = forkDefaultGateway(linkProperties.routes.map { (it.isDefaultRoute && (Build.VERSION.SDK_INT < 29 || it.hasGateway())) to it.gateway })
+            gateway?.let { payload.put("gateway", it) }
+            if (Build.VERSION.SDK_INT >= 30) linkProperties.dhcpServerAddress?.hostAddress?.let { payload.put("dhcpServer", it) }
+            if (transport == "wifi") {
+                val wifiManager = applicationContext.getSystemService(WifiManager::class.java)
+                val wifiInfo = runCatching {
+                    if (Build.VERSION.SDK_INT >= 31) networkCapabilities[network]?.transportInfo as? WifiInfo
+                    else wifiManager.connectionInfo
+                }.getOrNull()
+                forkWifiFields(transport, wifiInfo?.ssid, wifiInfo?.bssid).forEach { (key, value) -> payload.put(key, value) }
+                if (Build.VERSION.SDK_INT < 30) {
+                    val address = runCatching { wifiManager.dhcpInfo?.serverAddress ?: 0 }.getOrDefault(0)
+                    if (address != 0) payload.put("dhcpServer", InetAddress.getByAddress(ByteArray(4) { (address shr (it * 8)).toByte() }).hostAddress)
+                }
+            }
             AndroidNetworkCandidate(
                 name = interfaceName,
                 payload = payload,
-                isActive = network == activeNetwork,
+                isActive = network == physicalDefault,
                 isValidated = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED),
             )
         }
-        if (candidates.isEmpty()) {
+        if (candidates.isEmpty() || (physicalDefault == null && underlyingKnown)) {
             Log.w(TAG, "no non-vpn internet network info available reason=$reason")
             val payload = JSONObject()
                 .put("defaultInterface", "")
                 .put("interfaces", JSONArray())
             return AndroidNetworkSnapshot(payload, "", 0)
         }
-        val default = candidates.firstOrNull { it.isActive && it.isValidated }
-            ?: candidates.firstOrNull { it.isActive }
-            ?: candidates.firstOrNull { it.isValidated }
-            ?: candidates.first()
+        // A callback still pending is not evidence of disconnection. Keep the
+        // previous core snapshot until the authoritative default is ready.
+        if (physicalDefault == null) return null
+        if (!forkNetworkReady(physicalDefault, networkCapabilities, networkLinks)) return null
+        val default = candidates.firstOrNull { it.isActive } ?: return null
         val interfaces = JSONArray()
         candidates.forEach { interfaces.put(it.payload) }
         val payload = JSONObject()

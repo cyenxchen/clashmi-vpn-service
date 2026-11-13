@@ -15,7 +15,6 @@ import (
 	"syscall"
 
 	"github.com/metacubex/mihomo/adapter/inbound"
-	"github.com/metacubex/mihomo/adapter/outbound"
 	"github.com/metacubex/mihomo/component/dialer"
 	mihomoResolver "github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/component/trie"
@@ -77,13 +76,17 @@ func SetAndroidNetworkInfo(raw string) error {
 		log.Warnln("[ClashMiCore] parse Android network snapshot failed: %v", err)
 		return err
 	}
+	reportErr := forkReportAndroidNetwork(info)
+	if reportErr != nil {
+		log.Warnln("[ClashMiCore] subnet network report failed: %v", reportErr)
+	}
 	defer androidNetworkHealth.update(info)
-	dnsChanged := setTailscaleAndroidDNSServers(info)
-	registered, notified := outbound.NotifyTailscaleNetworkChange(info.DefaultInterface)
+	dnsChanged := forkSetAndroidDNSServers(info)
+	registered, notified := forkNotifyNetwork(info.DefaultInterface)
 	if dnsChanged {
-		if err := refreshAndroidTailscaleDNSPolicy(); err != nil {
+		if err := forkRefreshAndroidDNSPolicy(); err != nil {
 			log.Warnln("[ClashMiCore] refresh Android physical DNS policy failed: %v", err)
-			return err
+			return errors.Join(reportErr, err)
 		}
 	}
 	log.Infoln(
@@ -94,7 +97,7 @@ func SetAndroidNetworkInfo(raw string) error {
 		registered,
 		notified,
 	)
-	return nil
+	return reportErr
 }
 
 func Start(configFile string, patchFile string, finalPatchFile string, homeDir string, tunFd int, externalController string, secret string) error {

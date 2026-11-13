@@ -23,7 +23,8 @@ class ClashmiVpnServicePlugin :
     FlutterPlugin,
     MethodCallHandler,
     ActivityAware,
-    PluginRegistry.ActivityResultListener {
+    PluginRegistry.ActivityResultListener,
+    PluginRegistry.RequestPermissionsResultListener {
     private val tag = "ClashmiVpnService"
     private val mainHandler = Handler(Looper.getMainLooper())
     private lateinit var channel: MethodChannel
@@ -31,9 +32,11 @@ class ClashmiVpnServicePlugin :
     private var activity: Activity? = null
     private var activityBinding: ActivityPluginBinding? = null
     private var pendingPermissionStart = false
+    private lateinit var locationPermissions: ForkLocationPermissions
 
     override fun onAttachedToEngine(flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
         context = flutterPluginBinding.applicationContext
+        locationPermissions = ForkLocationPermissions(context) { activity }
         channel = MethodChannel(flutterPluginBinding.binaryMessenger, "clashmi_vpn_service")
         channel.setMethodCallHandler(this)
         ClashmiVpnRuntime.setStateEmitter { state, params ->
@@ -54,6 +57,7 @@ class ClashmiVpnServicePlugin :
         call: MethodCall,
         result: Result
     ) {
+        if (locationPermissions.handle(call, result)) return
         Log.i(tag, "method=${call.method}")
         when (call.method) {
             "getPlatformVersion" -> result.success("Android ${Build.VERSION.RELEASE}")
@@ -101,6 +105,7 @@ class ClashmiVpnServicePlugin :
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        locationPermissions.detach()
         channel.setMethodCallHandler(null)
         ClashmiVpnRuntime.setStateEmitter(null)
         Log.i(tag, "plugin detached")
@@ -110,6 +115,7 @@ class ClashmiVpnServicePlugin :
         activityBinding = binding
         activity = binding.activity
         binding.addActivityResultListener(this)
+        binding.addRequestPermissionsResultListener(this)
         Log.i(tag, "attached to activity")
     }
 
@@ -123,10 +129,14 @@ class ClashmiVpnServicePlugin :
 
     override fun onDetachedFromActivity() {
         activityBinding?.removeActivityResultListener(this)
+        activityBinding?.removeRequestPermissionsResultListener(this)
         activityBinding = null
         activity = null
         Log.i(tag, "detached from activity")
     }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray): Boolean =
+        locationPermissions.onResult(requestCode)
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?): Boolean {
         if (requestCode != REQUEST_VPN_PERMISSION) {
